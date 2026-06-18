@@ -6,13 +6,17 @@ MOUNT       ?= feature-management
 
 export VAULT_ADDR ?= http://127.0.0.1:8200
 
-.PHONY: all build test cover fmt vet tidy clean dev mock-server
+.PHONY: all build release-build test cover fmt fmt-check vet tidy ci clean dev mock-server
 
 all: build
 
 ## build: compile the plugin binary into ./bin
 build:
 	go build -o $(BIN_DIR)/$(PLUGIN_NAME) ./cmd/$(PLUGIN_NAME)
+
+## release-build: cross-compile release archives + checksums into ./dist
+release-build:
+	./scripts/build-release.sh $(VERSION)
 
 ## test: run unit tests
 test:
@@ -26,6 +30,10 @@ cover:
 fmt:
 	gofmt -w -l .
 
+## fmt-check: fail if any file is not gofmt-clean (used by CI)
+fmt-check:
+	@files="$$(gofmt -l .)"; if [ -n "$$files" ]; then echo "needs gofmt:"; echo "$$files"; exit 1; fi
+
 ## vet: run go vet
 vet:
 	go vet ./...
@@ -34,9 +42,13 @@ vet:
 tidy:
 	go mod tidy
 
+## ci: run the same checks as the CI workflow (fmt-check, vet, race tests)
+ci: fmt-check vet
+	go test -race ./...
+
 ## clean: remove build artifacts
 clean:
-	rm -rf $(BIN_DIR) $(PLUGIN_DIR)
+	rm -rf $(BIN_DIR) dist $(PLUGIN_DIR)
 
 ## dev: build into the plugin dir and (re)register + enable against a running dev Vault.
 ## Start a dev server first, e.g.:

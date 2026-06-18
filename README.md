@@ -62,6 +62,27 @@ make vet
 
 Requires Go 1.25.7+, Vault SDK v0.25.x. Targets Vault 2.0.
 
+## CI & releases
+
+CI (`.github/workflows/ci.yml`) runs on every push/PR: gofmt check, `go vet`,
+`go test -race`, and a cross-compile of the release archives (so packaging breaks
+are caught early). Run the same checks locally with `make ci`.
+
+Releases are automated with [release-please](https://github.com/googleapis/release-please)
+(`.github/workflows/release.yml`), driven by
+[Conventional Commits](https://www.conventionalcommits.org/):
+
+- `fix:` → patch, `feat:` → minor, `feat!:` / `BREAKING CHANGE:` → major (0.x bumps while pre-1.0).
+- release-please maintains a "release PR" that updates `CHANGELOG.md` and the
+  version in `.release-please-manifest.json`. Merging it tags `vX.Y.Z` and creates
+  the GitHub release.
+- On that release, the workflow cross-compiles `linux/{amd64,arm64}` and
+  `darwin/{amd64,arm64}`, then uploads `…_<os>_<arch>.zip` archives plus a
+  `…_SHA256SUMS` file (the checksum each consumer needs for
+  `vault plugin register -sha256=…`).
+
+`make release-build VERSION=v0.1.0` produces the same archives locally under `dist/`.
+
 ## Local end-to-end
 
 **Quick start — one command** (self-contained: builds everything, starts a throwaway
@@ -143,6 +164,40 @@ Dynatrace SSO token endpoint, requesting scopes
 refreshed. The plugin is the only component that holds the privileged FM
 credential; consumers only ever see minted SDK keys. The full SDK key secret is
 never logged — only the public prefix (`{token}.{platform}_{geo}_{publicRandom}`).
+
+## Memory locking (mlock)
+
+On startup the plugin calls `mlock.LockMemory()` (`cmd/vault-plugin-secrets-feature-management/main.go`)
+to keep secret material — the privileged FM credential and minted SDK keys — out
+of swap. This is **best-effort**: if locking isn't permitted the plugin logs a
+warning (`failed to lock memory; secrets may be paged to swap`) and continues, so
+it still runs without the capability.
+
+On Linux, `mlock(2)` requires the `CAP_IPC_LOCK` capability. When the Vault
+server runs with mlock **enabled** (the default — i.e. `disable_mlock` is not set
+to `true`), grant the capability to the plugin binary in Vault's
+`plugin_directory`:
+
+```sh
+sudo setcap cap_ipc_lock=+ep /etc/vault/plugins/vault-plugin-secrets-feature-management
+```
+
+Notes:
+
+- **Re-apply after every deploy.** The capability is stored on the file, so it
+  must be re-set each time the binary is replaced (new release, rebuild, or
+  re-extracting a release archive into the plugin directory).
+- **It does not change the registration checksum.** `setcap` writes the
+  `security.capability` extended attribute, not the file's bytes, so the binary's
+  `sha256` is unchanged — `vault plugin register -sha256=…` works the same before
+  or after `setcap`.
+- **Containers:** grant `IPC_LOCK` to the container instead (Docker
+  `--cap-add IPC_LOCK`, Kubernetes `securityContext.capabilities.add: ["IPC_LOCK"]`)
+  and ensure the `memlock` ulimit is high enough.
+- **`disable_mlock = true`:** if the Vault server disables mlock (e.g. on hosts
+  with swap turned off, where `setcap` is impractical), the plugin's locking
+  failure is expected and harmless — but you're then relying on the host having no
+  swap to keep secrets off disk.
 
 ## Known limitations
 
