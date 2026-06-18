@@ -63,28 +63,22 @@ func currentStorageKey(coord coordinate) string {
 	return storageCurrentPrefix + hex.EncodeToString([]byte(coord.String()))
 }
 
+// coordinate reconstructs the coordinate this record belongs to.
+func (ck *currentKey) coordinate() coordinate {
+	return coordinate{
+		Version:      ck.Version,
+		ReleaseStage: ck.ReleaseStage,
+		Project:      ck.Project,
+		Type:         fmclient.SdkKeyType(ck.Type),
+	}
+}
+
 func (b *backend) readCurrentKey(ctx context.Context, s logical.Storage, coord coordinate) (*currentKey, error) {
-	entry, err := s.Get(ctx, currentStorageKey(coord))
-	if err != nil {
-		return nil, err
-	}
-	if entry == nil {
-		return nil, nil
-	}
-	var ck currentKey
-	if err := entry.DecodeJSON(&ck); err != nil {
-		return nil, err
-	}
-	return &ck, nil
+	return getJSON[currentKey](ctx, s, currentStorageKey(coord))
 }
 
 func (b *backend) writeCurrentKey(ctx context.Context, s logical.Storage, ck *currentKey) error {
-	coord := coordinate{Version: ck.Version, ReleaseStage: ck.ReleaseStage, Project: ck.Project, Type: fmclient.SdkKeyType(ck.Type)}
-	entry, err := logical.StorageEntryJSON(currentStorageKey(coord), ck)
-	if err != nil {
-		return err
-	}
-	return s.Put(ctx, entry)
+	return putJSON(ctx, s, currentStorageKey(ck.coordinate()), ck)
 }
 
 // clearCurrentIfMatches removes the current-key record for coord iff it still
@@ -140,7 +134,10 @@ func (b *backend) pathCoordinateRead() *framework.Path {
 	}
 }
 
-func (b *backend) pathCoordinateReadOp(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+// coordinateFromRequest parses and validates the coordinate from the request
+// path and resolves its policy role. On a client error it returns a non-nil
+// *logical.Response (a 4xx) that the caller must return unchanged.
+func (b *backend) coordinateFromRequest(ctx context.Context, req *logical.Request, d *framework.FieldData) (coordinate, *roleEntry, *logical.Response) {
 	coord, err := parseCoordinate(
 		d.Get("version").(string),
 		d.Get("release_stage").(string),
@@ -148,12 +145,19 @@ func (b *backend) pathCoordinateReadOp(ctx context.Context, req *logical.Request
 		d.Get("type").(string),
 	)
 	if err != nil {
-		return logical.ErrorResponse(err.Error()), nil
+		return coordinate{}, nil, logical.ErrorResponse(err.Error())
 	}
-
 	role, err := b.resolveRole(ctx, req.Storage, coord)
 	if err != nil {
-		return logical.ErrorResponse(err.Error()), nil
+		return coordinate{}, nil, logical.ErrorResponse(err.Error())
+	}
+	return coord, role, nil
+}
+
+func (b *backend) pathCoordinateReadOp(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	coord, role, errResp := b.coordinateFromRequest(ctx, req, d)
+	if errResp != nil {
+		return errResp, nil
 	}
 
 	lock := b.lockCoordinate(coord)
@@ -254,24 +258,5 @@ func (b *backend) secretRevoke(ctx context.Context, req *logical.Request, _ *fra
 // listCurrentKeys decodes every current-key record. Used by reconciliation and
 // the orphan reaper.
 func (b *backend) listCurrentKeys(ctx context.Context, s logical.Storage) ([]*currentKey, error) {
-	suffixes, err := s.List(ctx, storageCurrentPrefix)
-	if err != nil {
-		return nil, err
-	}
-	var out []*currentKey
-	for _, suffix := range suffixes {
-		entry, err := s.Get(ctx, storageCurrentPrefix+suffix)
-		if err != nil {
-			return nil, err
-		}
-		if entry == nil {
-			continue
-		}
-		var ck currentKey
-		if err := entry.DecodeJSON(&ck); err != nil {
-			return nil, err
-		}
-		out = append(out, &ck)
-	}
-	return out, nil
+	return listAndDecode[currentKey](ctx, s, storageCurrentPrefix)
 }

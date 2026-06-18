@@ -74,8 +74,7 @@ func (b *backend) pathReconcileOp(ctx context.Context, req *logical.Request, d *
 			}
 		}
 		if !found {
-			coord := coordinate{Version: ck.Version, ReleaseStage: ck.ReleaseStage, Project: ck.Project, Type: fmclient.SdkKeyType(ck.Type)}
-			if err := b.clearCurrentIfMatches(ctx, req.Storage, coord, ck.FullSDKKey); err != nil {
+			if err := b.clearCurrentIfMatches(ctx, req.Storage, ck.coordinate(), ck.FullSDKKey); err != nil {
 				return nil, err
 			}
 			clearedStale = append(clearedStale, ck.PublicPrefix)
@@ -88,16 +87,14 @@ func (b *backend) pathReconcileOp(ctx context.Context, req *logical.Request, d *
 		if err != nil {
 			return nil, err
 		}
-		for _, group := range [][]fmclient.SDKKeyDetails{list.Web, list.Mobile, list.Server} {
-			for _, k := range group {
-				if tracked[k.SdkKey] {
-					continue
-				}
-				orphans = append(orphans, fmclient.PublicPrefix(k.SdkKey))
-				if deleteOrphans {
-					if err := client.DeleteSdkKey(ctx, bkt.project, bkt.stage, k.SdkKey); err != nil && !fmclient.IsNotFound(err) {
-						return nil, err
-					}
+		for _, k := range list.All() {
+			if tracked[k.SdkKey] {
+				continue
+			}
+			orphans = append(orphans, fmclient.PublicPrefix(k.SdkKey))
+			if deleteOrphans {
+				if err := client.DeleteSdkKey(ctx, bkt.project, bkt.stage, k.SdkKey); err != nil && !fmclient.IsNotFound(err) {
+					return nil, err
 				}
 			}
 		}

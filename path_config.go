@@ -48,18 +48,7 @@ func (c *fmConfig) scopesOrDefault() []string {
 }
 
 func (b *backend) readConfig(ctx context.Context, s logical.Storage) (*fmConfig, error) {
-	entry, err := s.Get(ctx, storageConfig)
-	if err != nil {
-		return nil, err
-	}
-	if entry == nil {
-		return nil, nil
-	}
-	var cfg fmConfig
-	if err := entry.DecodeJSON(&cfg); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
+	return getJSON[fmConfig](ctx, s, storageConfig)
 }
 
 func (b *backend) pathConfig() *framework.Path {
@@ -180,11 +169,7 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 		return logical.ErrorResponse("invalid dt_tenant %q: must be 8-10 alphanumeric characters", cfg.Tenant), nil
 	}
 
-	entry, err := logical.StorageEntryJSON(storageConfig, cfg)
-	if err != nil {
-		return nil, err
-	}
-	if err := req.Storage.Put(ctx, entry); err != nil {
+	if err := putJSON(ctx, req.Storage, storageConfig, cfg); err != nil {
 		return nil, err
 	}
 

@@ -58,18 +58,7 @@ func (r *roleEntry) matches(coord coordinate) (bool, int) {
 }
 
 func (b *backend) readRole(ctx context.Context, s logical.Storage, name string) (*roleEntry, error) {
-	entry, err := s.Get(ctx, storageRolePrefix+name)
-	if err != nil {
-		return nil, err
-	}
-	if entry == nil {
-		return nil, nil
-	}
-	var role roleEntry
-	if err := entry.DecodeJSON(&role); err != nil {
-		return nil, err
-	}
-	return &role, nil
+	return getJSON[roleEntry](ctx, s, storageRolePrefix+name)
 }
 
 // resolveRole returns the most-specific role matching coord. If several roles
@@ -237,11 +226,7 @@ func (b *backend) pathRoleWrite(ctx context.Context, req *logical.Request, d *fr
 		resp.AddWarning("rotation_grace is >= ttl; the grace window should be short relative to the key lifecycle")
 	}
 
-	entry, err := logical.StorageEntryJSON(storageRolePrefix+name, role)
-	if err != nil {
-		return nil, err
-	}
-	if err := req.Storage.Put(ctx, entry); err != nil {
+	if err := putJSON(ctx, req.Storage, storageRolePrefix+name, role); err != nil {
 		return nil, err
 	}
 	return resp, nil

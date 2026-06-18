@@ -23,30 +23,30 @@ lease expiry/revoke ──▶ FM deleteSdkKey
 rotate path ──▶ createSdkKey (new) + tombstone old (deleted after rotation_grace)
 ```
 
-| Component | File |
-|---|---|
-| Backend wiring, client cache, locks | `backend.go` |
-| Coordinate parsing/validation | `coordinate.go` |
-| `config` path | `path_config.go` |
-| `roles/<name>` (policy templates) | `path_roles.go` |
-| Coordinate read + secret type (Renew/Revoke) | `path_coordinate.go` |
-| `rotate/...` path | `path_rotate.go` |
-| Deferred-delete queue + periodic sweep | `rotation.go` |
-| Create crash-safety (WAL) + orphan reaper | `wal.go` |
-| `reconcile` path | `path_reconcile.go` |
-| FM API client (internal) | `internal/fmclient/` |
-| Plugin entrypoint | `cmd/vault-plugin-secrets-feature-management/` |
+| Component                                    | File                                           |
+|----------------------------------------------|------------------------------------------------|
+| Backend wiring, client cache, locks          | `backend.go`                                   |
+| Coordinate parsing/validation                | `coordinate.go`                                |
+| `config` path                                | `path_config.go`                               |
+| `roles/<name>` (policy templates)            | `path_roles.go`                                |
+| Coordinate read + secret type (Renew/Revoke) | `path_coordinate.go`                           |
+| `rotate/...` path                            | `path_rotate.go`                               |
+| Deferred-delete queue + periodic sweep       | `rotation.go`                                  |
+| Create crash-safety (WAL) + orphan reaper    | `wal.go`                                       |
+| `reconcile` path                             | `path_reconcile.go`                            |
+| FM API client (internal)                     | `internal/fmclient/`                           |
+| Plugin entrypoint                            | `cmd/vault-plugin-secrets-feature-management/` |
 
 ## Plugin paths
 
-| Path | Verb | Purpose |
-|---|---|---|
-| `config` | write/read/delete | FM base URL, OAuth client (`client_id`/`client_secret`/`token_url`), `dt_tenant`. |
-| `roles/<name>` | write/read/delete | Policy template: `ttl`, `max_ttl`, `rotation_grace`, optional `project_key`/`release_stage_key`/`type` constraints. |
-| `roles` | list | List roles. |
-| `<version>/<release-stage>/<project>/<type>` | read | Read (lazily mint) the current key for a coordinate; issues a lease. |
-| `rotate/<version>/<release-stage>/<project>/<type>` | write | Force a rotation (new key now; old deleted after `rotation_grace`). |
-| `reconcile` | write | Clear stale current keys and report/optionally delete orphaned FM keys. |
+| Path                                                | Verb              | Purpose                                                                                                             |
+|-----------------------------------------------------|-------------------|---------------------------------------------------------------------------------------------------------------------|
+| `config`                                            | write/read/delete | FM base URL, OAuth client (`client_id`/`client_secret`/`token_url`), `dt_tenant`.                                   |
+| `roles/<name>`                                      | write/read/delete | Policy template: `ttl`, `max_ttl`, `rotation_grace`, optional `project_key`/`release_stage_key`/`type` constraints. |
+| `roles`                                             | list              | List roles.                                                                                                         |
+| `<version>/<release-stage>/<project>/<type>`        | read              | Read (lazily mint) the current key for a coordinate; issues a lease.                                                |
+| `rotate/<version>/<release-stage>/<project>/<type>` | write             | Force a rotation (new key now; old deleted after `rotation_grace`).                                                 |
+| `reconcile`                                         | write             | Clear stale current keys and report/optionally delete orphaned FM keys.                                             |
 
 `<version>` is the SDK-key **format** version (the `dtNN` token, e.g. `dt01`), not
 an API or plugin version. Every coordinate element is a path segment so Vault

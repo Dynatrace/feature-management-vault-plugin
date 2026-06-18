@@ -76,6 +76,15 @@ func (l SDKKeyList) OfType(t SdkKeyType) []SDKKeyDetails {
 	}
 }
 
+// All returns every key across all types.
+func (l SDKKeyList) All() []SDKKeyDetails {
+	out := make([]SDKKeyDetails, 0, len(l.Web)+len(l.Mobile)+len(l.Server))
+	out = append(out, l.Web...)
+	out = append(out, l.Mobile...)
+	out = append(out, l.Server...)
+	return out
+}
+
 // PublicPrefix returns the log-safe portion of an SDK key: the first two
 // dot-delimited segments (`{token}.{platform}_{geo}_{publicRandom}`). The third
 // segment (`{secret}_{sha1}`) is private and must never appear in logs,
