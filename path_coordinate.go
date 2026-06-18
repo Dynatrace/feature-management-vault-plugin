@@ -169,7 +169,9 @@ func (b *backend) pathCoordinateReadOp(ctx context.Context, req *logical.Request
 		return nil, err
 	}
 	var warning string
+	minted := false
 	if ck == nil {
+		minted = true
 		ck, warning, err = b.mintAndStore(ctx, req.Storage, coord, false)
 		if err != nil {
 			b.Logger().Error("failed to mint SDK key", "coordinate", coord.String(), "error", err)
@@ -197,6 +199,7 @@ func (b *backend) pathCoordinateReadOp(ctx context.Context, req *logical.Request
 	if warning != "" {
 		resp.AddWarning(warning)
 	}
+	b.metrics.recordIssued(ctx, coord, minted)
 	return resp, nil
 }
 
@@ -226,6 +229,7 @@ func (b *backend) secretRevoke(ctx context.Context, req *logical.Request, _ *fra
 	stage, _ := req.Secret.InternalData["release_stage"].(string)
 	coordStr, _ := req.Secret.InternalData["coordinate"].(string)
 	prefix, _ := req.Secret.InternalData["public_prefix"].(string)
+	keyType, _ := req.Secret.InternalData["type"].(string)
 	if full == "" {
 		return nil, fmt.Errorf("revoke: missing internal full_sdk_key")
 	}
@@ -236,6 +240,7 @@ func (b *backend) secretRevoke(ctx context.Context, req *logical.Request, _ *fra
 	}
 
 	delErr := client.DeleteSdkKey(ctx, project, stage, full)
+	b.metrics.recordRevoked(ctx, keyType, stage, delErr)
 	if delErr != nil && !fmclient.IsNotFound(delErr) {
 		if coord, perr := parseCoordinateString(coordStr); perr == nil {
 			_ = b.enqueueTombstone(ctx, req.Storage, coord, full, time.Now())
