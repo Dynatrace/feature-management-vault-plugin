@@ -21,6 +21,7 @@ import (
 	"net/http"
 
 	"github.com/dynatrace/feature-management-vault-plugin/internal/fmclient"
+	"github.com/dynatrace/feature-management-vault-plugin/internal/fmclient/fmclienttest"
 )
 
 const apiBase = "/public/feature-management-service/v0.1"
@@ -29,7 +30,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8899", "listen address")
 	flag.Parse()
 
-	store := fmclient.NewFake()
+	store := fmclienttest.New()
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /sso/oauth2/token", func(w http.ResponseWriter, _ *http.Request) {
