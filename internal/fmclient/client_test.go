@@ -1,4 +1,4 @@
-package fmclient
+package fmclient_test
 
 import (
 	"context"
@@ -9,15 +9,18 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/dynatrace/feature-management-vault-plugin/internal/fmclient"
+	"github.com/dynatrace/feature-management-vault-plugin/internal/fmclient/fmclienttest"
 )
 
 const testAPIBase = "/public/feature-management-service/v0.1"
 
-// newTestServerAndClient spins up an httptest server backed by a Fake and a
+// newTestServerAndClient spins up an httptest server backed by a fake and a
 // client pointed at it.
-func newTestServerAndClient(t *testing.T) (*httptest.Server, *Client, *seenHeaders) {
+func newTestServerAndClient(t *testing.T) (*httptest.Server, *fmclient.Client, *seenHeaders) {
 	t.Helper()
-	store := NewFake()
+	store := fmclienttest.New()
 	seen := &seenHeaders{}
 
 	mux := http.NewServeMux()
@@ -30,7 +33,7 @@ func newTestServerAndClient(t *testing.T) (*httptest.Server, *Client, *seenHeade
 	})
 	mux.HandleFunc("POST "+testAPIBase+"/projects/{p}/release-stages/{s}/sdk-keys", func(w http.ResponseWriter, r *http.Request) {
 		seen.record(r)
-		var body SdkKeyCreate
+		var body fmclient.SdkKeyCreate
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		d, err := store.CreateSdkKey(r.Context(), r.PathValue("p"), r.PathValue("s"), body.Type)
 		if err != nil {
@@ -49,7 +52,7 @@ func newTestServerAndClient(t *testing.T) (*httptest.Server, *Client, *seenHeade
 	mux.HandleFunc("DELETE "+testAPIBase+"/projects/{p}/release-stages/{s}/sdk-keys/{k}", func(w http.ResponseWriter, r *http.Request) {
 		seen.record(r)
 		err := store.DeleteSdkKey(r.Context(), r.PathValue("p"), r.PathValue("s"), r.PathValue("k"))
-		if IsNotFound(err) {
+		if fmclient.IsNotFound(err) {
 			writeEnvelope(w, http.StatusNotFound, "not found")
 			return
 		}
@@ -59,7 +62,7 @@ func newTestServerAndClient(t *testing.T) (*httptest.Server, *Client, *seenHeade
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	c, err := New(Config{
+	c, err := fmclient.New(fmclient.Config{
 		BaseURL:      srv.URL + testAPIBase,
 		TokenURL:     srv.URL + "/token",
 		ClientID:     "id",
@@ -85,17 +88,17 @@ func (s *seenHeaders) record(r *http.Request) {
 func writeEnvelope(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(ErrorEnvelope{Code: status, Message: msg})
+	_ = json.NewEncoder(w).Encode(fmclient.ErrorEnvelope{Code: status, Message: msg})
 }
 
 func TestClient_CreateListDelete(t *testing.T) {
 	ctx := context.Background()
 	_, c, seen := newTestServerAndClient(t)
 
-	details, err := c.CreateSdkKey(ctx, "checkout", "production", SdkKeyTypeServer)
+	details, err := c.CreateSdkKey(ctx, "checkout", "production", fmclient.SdkKeyTypeServer)
 	require.NoError(t, err)
 	require.True(t, strings.HasPrefix(details.SdkKey, "dt01.server_"), "got %q", details.SdkKey)
-	require.Equal(t, SdkKeyTypeServer, details.Type)
+	require.Equal(t, fmclient.SdkKeyTypeServer, details.Type)
 
 	// Auth + tenant headers and OAuth grant type were sent.
 	require.Equal(t, "Bearer tok", seen.auth)
@@ -117,15 +120,15 @@ func TestClient_CreateListDelete(t *testing.T) {
 func TestClient_DeleteNotFound(t *testing.T) {
 	_, c, _ := newTestServerAndClient(t)
 	err := c.DeleteSdkKey(context.Background(), "checkout", "production", "dt01.server_us_abcdefghij.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_bbbbbbbbbb")
-	require.True(t, IsNotFound(err), "expected ErrNotFound, got %v", err)
+	require.True(t, fmclient.IsNotFound(err), "expected ErrNotFound, got %v", err)
 }
 
 func TestClient_APIError(t *testing.T) {
 	_, c, _ := newTestServerAndClient(t)
 	// Invalid type triggers the fake's create error -> 400 with envelope.
-	_, err := c.CreateSdkKey(context.Background(), "checkout", "production", SdkKeyType("bogus"))
+	_, err := c.CreateSdkKey(context.Background(), "checkout", "production", fmclient.SdkKeyType("bogus"))
 	require.Error(t, err)
-	var apiErr *APIError
+	var apiErr *fmclient.APIError
 	require.ErrorAs(t, err, &apiErr)
 	require.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
 	require.NotNil(t, apiErr.Envelope)
@@ -133,6 +136,6 @@ func TestClient_APIError(t *testing.T) {
 
 func TestPublicPrefix(t *testing.T) {
 	full := "dt01.server_us_ab3xy9kp2q.03ee0ef7cd4244bfb8b71fea8f783f53_d4f8a9c12a"
-	require.Equal(t, "dt01.server_us_ab3xy9kp2q", PublicPrefix(full))
-	require.Equal(t, "<redacted-sdk-key>", PublicPrefix("nope"))
+	require.Equal(t, "dt01.server_us_ab3xy9kp2q", fmclient.PublicPrefix(full))
+	require.Equal(t, "<redacted-sdk-key>", fmclient.PublicPrefix("nope"))
 }

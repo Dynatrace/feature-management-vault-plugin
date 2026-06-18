@@ -29,19 +29,9 @@ func (b *backend) pathRotate() *framework.Path {
 }
 
 func (b *backend) pathRotateOp(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	coord, err := parseCoordinate(
-		d.Get("version").(string),
-		d.Get("release_stage").(string),
-		d.Get("project").(string),
-		d.Get("type").(string),
-	)
-	if err != nil {
-		return logical.ErrorResponse(err.Error()), nil
-	}
-
-	role, err := b.resolveRole(ctx, req.Storage, coord)
-	if err != nil {
-		return logical.ErrorResponse(err.Error()), nil
+	coord, role, errResp := b.coordinateFromRequest(ctx, req, d)
+	if errResp != nil {
+		return errResp, nil
 	}
 
 	lock := b.lockCoordinate(coord)

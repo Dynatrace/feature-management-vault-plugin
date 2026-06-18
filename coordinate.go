@@ -74,10 +74,6 @@ func parseCoordinateString(s string) (coordinate, error) {
 // tokenVersion extracts the `dtNN` token from a full SDK key, used to verify a
 // minted key's format version matches the requested coordinate.
 func tokenVersion(sdkKey string) string {
-	for i := 0; i < len(sdkKey); i++ {
-		if sdkKey[i] == '.' {
-			return sdkKey[:i]
-		}
-	}
-	return ""
+	token, _, _ := strings.Cut(sdkKey, ".")
+	return token
 }

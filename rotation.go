@@ -2,6 +2,7 @@ package featuremanagement
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	uuid "github.com/hashicorp/go-uuid"
@@ -55,44 +56,11 @@ func (b *backend) enqueueTombstone(ctx context.Context, s logical.Storage, coord
 }
 
 func (b *backend) putTombstone(ctx context.Context, s logical.Storage, t *deletionTombstone) error {
-	entry, err := logical.StorageEntryJSON(storageTombstonePrefix+t.ID, t)
-	if err != nil {
-		return err
-	}
-	return s.Put(ctx, entry)
-}
-
-func (b *backend) getTombstone(ctx context.Context, s logical.Storage, id string) (*deletionTombstone, error) {
-	entry, err := s.Get(ctx, storageTombstonePrefix+id)
-	if err != nil {
-		return nil, err
-	}
-	if entry == nil {
-		return nil, nil
-	}
-	var t deletionTombstone
-	if err := entry.DecodeJSON(&t); err != nil {
-		return nil, err
-	}
-	return &t, nil
+	return putJSON(ctx, s, storageTombstonePrefix+t.ID, t)
 }
 
 func (b *backend) listTombstones(ctx context.Context, s logical.Storage) ([]*deletionTombstone, error) {
-	ids, err := s.List(ctx, storageTombstonePrefix)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]*deletionTombstone, 0, len(ids))
-	for _, id := range ids {
-		t, err := b.getTombstone(ctx, s, id)
-		if err != nil {
-			return nil, err
-		}
-		if t != nil {
-			out = append(out, t)
-		}
-	}
-	return out, nil
+	return listAndDecode[deletionTombstone](ctx, s, storageTombstonePrefix)
 }
 
 // tombstonedKeys returns the set of full SDK keys currently scheduled for
@@ -123,20 +91,20 @@ func (b *backend) periodicFunc(ctx context.Context, req *logical.Request) error 
 	}
 
 	now := time.Now()
-	var firstErr error
+	var errs []error
 	for _, t := range tombs {
 		if now.Before(t.DeleteAfter) {
 			continue
 		}
 		client, err := b.getClient(ctx, req.Storage)
 		if err != nil {
-			firstErr = orFirst(firstErr, err)
+			errs = append(errs, err)
 			continue
 		}
 		delErr := client.DeleteSdkKey(ctx, t.Project, t.ReleaseStage, t.FullSDKKey)
 		if delErr == nil || fmclient.IsNotFound(delErr) {
 			if err := req.Storage.Delete(ctx, storageTombstonePrefix+t.ID); err != nil {
-				firstErr = orFirst(firstErr, err)
+				errs = append(errs, err)
 			}
 			continue
 		}
@@ -150,16 +118,9 @@ func (b *backend) periodicFunc(ctx context.Context, req *logical.Request) error 
 			t.DeleteAfter = now.Add(deadLetterBackoff)
 		}
 		if err := b.putTombstone(ctx, req.Storage, t); err != nil {
-			firstErr = orFirst(firstErr, err)
+			errs = append(errs, err)
 		}
-		firstErr = orFirst(firstErr, delErr)
+		errs = append(errs, delErr)
 	}
-	return firstErr
-}
-
-func orFirst(first, err error) error {
-	if first == nil {
-		return err
-	}
-	return first
+	return errors.Join(errs...)
 }

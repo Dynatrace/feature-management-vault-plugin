@@ -11,11 +11,12 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/dynatrace/feature-management-vault-plugin/internal/fmclient"
+	"github.com/dynatrace/feature-management-vault-plugin/internal/fmclient/fmclienttest"
 )
 
-func testBackend(t *testing.T) (*backend, *fmclient.Fake, logical.Storage) {
+func testBackend(t *testing.T) (*backend, *fmclienttest.Fake, logical.Storage) {
 	t.Helper()
-	fake := fmclient.NewFake()
+	fake := fmclienttest.New()
 	b := newBackend()
 	b.clientFactory = func(_ fmclient.Config) (fmclient.FMClient, error) { return fake, nil }
 
