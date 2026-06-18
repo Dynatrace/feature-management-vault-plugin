@@ -7,3 +7,5 @@ coverage.out
 # Editor / OS
 *.log
 .DS_Store
+/.idea
+**.iml
