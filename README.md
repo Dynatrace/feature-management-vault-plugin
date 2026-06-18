@@ -165,6 +165,40 @@ refreshed. The plugin is the only component that holds the privileged FM
 credential; consumers only ever see minted SDK keys. The full SDK key secret is
 never logged — only the public prefix (`{token}.{platform}_{geo}_{publicRandom}`).
 
+## Memory locking (mlock)
+
+On startup the plugin calls `mlock.LockMemory()` (`cmd/vault-plugin-secrets-feature-management/main.go`)
+to keep secret material — the privileged FM credential and minted SDK keys — out
+of swap. This is **best-effort**: if locking isn't permitted the plugin logs a
+warning (`failed to lock memory; secrets may be paged to swap`) and continues, so
+it still runs without the capability.
+
+On Linux, `mlock(2)` requires the `CAP_IPC_LOCK` capability. When the Vault
+server runs with mlock **enabled** (the default — i.e. `disable_mlock` is not set
+to `true`), grant the capability to the plugin binary in Vault's
+`plugin_directory`:
+
+```sh
+sudo setcap cap_ipc_lock=+ep /etc/vault/plugins/vault-plugin-secrets-feature-management
+```
+
+Notes:
+
+- **Re-apply after every deploy.** The capability is stored on the file, so it
+  must be re-set each time the binary is replaced (new release, rebuild, or
+  re-extracting a release archive into the plugin directory).
+- **It does not change the registration checksum.** `setcap` writes the
+  `security.capability` extended attribute, not the file's bytes, so the binary's
+  `sha256` is unchanged — `vault plugin register -sha256=…` works the same before
+  or after `setcap`.
+- **Containers:** grant `IPC_LOCK` to the container instead (Docker
+  `--cap-add IPC_LOCK`, Kubernetes `securityContext.capabilities.add: ["IPC_LOCK"]`)
+  and ensure the `memlock` ulimit is high enough.
+- **`disable_mlock = true`:** if the Vault server disables mlock (e.g. on hosts
+  with swap turned off, where `setcap` is impractical), the plugin's locking
+  failure is expected and harmless — but you're then relying on the host having no
+  swap to keep secrets off disk.
+
 ## Known limitations
 
 - **Shared key per coordinate.** A coordinate has one current key; every read
