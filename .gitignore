@@ -1,6 +1,8 @@
 # Build artifacts
 /bin/
 /vault/
+/dist/
+coverage.out
 
 # Editor / OS
 *.log
