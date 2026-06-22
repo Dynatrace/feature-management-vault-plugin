@@ -1,0 +1,57 @@
+# GoReleaser configuration for the Feature Management Vault plugin.
+# Docs: https://goreleaser.com
+#
+# In CI this is driven by release-please (.github/workflows/release.yml): once a
+# release PR is merged, release-please tags vX.Y.Z and creates the GitHub
+# release, then GoReleaser builds the binaries and uploads them to that existing
+# release (release.mode: keep-existing — it never owns the release notes).
+version: 2
+
+project_name: vault-plugin-dynatrace-feature-management
+
+before:
+  hooks:
+    # `download` (not `tidy`) so the hook never mutates the tagged tree.
+    - go mod download
+
+builds:
+  - id: plugin
+    main: ./cmd/vault-plugin-dynatrace-feature-management
+    binary: vault-plugin-dynatrace-feature-management
+    env:
+      - CGO_ENABLED=0 # static, portable plugin binaries
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: plugin
+    formats: [zip]
+    # Matches the prior naming: <name>_<version>_<os>_<arch>.zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_SHA256SUMS"
+  algorithm: sha256
+
+# release-please owns the changelog/release notes; GoReleaser must not generate
+# or overwrite them.
+changelog:
+  disable: true
+
+release:
+  # Upload artifacts to the release that release-please already created; keep its
+  # notes intact. replace_existing_artifacts makes re-runs idempotent.
+  mode: keep-existing
+  replace_existing_artifacts: true
+
+snapshot:
+  # Used by `goreleaser release --snapshot` for local/CI verification builds.
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"

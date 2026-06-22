@@ -65,23 +65,26 @@ Requires Go 1.25.7+, Vault SDK v0.25.x. Targets Vault 2.0.
 ## CI & releases
 
 CI (`.github/workflows/ci.yml`) runs on every push/PR: gofmt check, `go vet`,
-`go test -race`, and a cross-compile of the release archives (so packaging breaks
-are caught early). Run the same checks locally with `make ci`.
+`go test -race`, and a GoReleaser snapshot build (the full release pipeline
+without publishing, so packaging breaks are caught early). Run the same checks
+locally with `make ci`.
 
 Releases are automated with [release-please](https://github.com/googleapis/release-please)
-(`.github/workflows/release.yml`), driven by
++ [GoReleaser](https://goreleaser.com) (`.github/workflows/release.yml`), driven by
 [Conventional Commits](https://www.conventionalcommits.org/):
 
 - `fix:` → patch, `feat:` → minor, `feat!:` / `BREAKING CHANGE:` → major (0.x bumps while pre-1.0).
 - release-please maintains a "release PR" that updates `CHANGELOG.md` and the
   version in `.release-please-manifest.json`. Merging it tags `vX.Y.Z` and creates
   the GitHub release.
-- On that release, the workflow cross-compiles `linux/{amd64,arm64}` and
-  `darwin/{amd64,arm64}`, then uploads `…_<os>_<arch>.zip` archives plus a
-  `…_SHA256SUMS` file (the checksum each consumer needs for
-  `vault plugin register -sha256=…`).
+- On that release, GoReleaser (`.goreleaser.yaml`) cross-compiles
+  `linux/{amd64,arm64}` and `darwin/{amd64,arm64}` and uploads `…_<os>_<arch>.zip`
+  archives plus a `…_SHA256SUMS` file to the release (it keeps the
+  release-please-generated notes; it does not create its own release). The build
+  injects the tag into `main.version` via ldflags.
 
-`make release-build VERSION=v0.1.0` produces the same archives locally under `dist/`.
+`make release-build` runs the same GoReleaser pipeline locally as a snapshot
+(into `dist/`, no publish); `make release-check` validates `.goreleaser.yaml`.
 
 ## Local end-to-end
 

@@ -6,7 +6,7 @@ MOUNT       ?= feature-management
 
 export VAULT_ADDR ?= http://127.0.0.1:8200
 
-.PHONY: all build release-build test cover fmt fmt-check vet tidy ci clean dev mock-server
+.PHONY: all build release-build release-check test cover fmt fmt-check vet tidy ci clean dev mock-server
 
 all: build
 
@@ -14,9 +14,13 @@ all: build
 build:
 	go build -o $(BIN_DIR)/$(PLUGIN_NAME) ./cmd/$(PLUGIN_NAME)
 
-## release-build: cross-compile release archives + checksums into ./dist
+## release-build: cross-compile release archives + checksums into ./dist via GoReleaser (snapshot, no publish)
 release-build:
-	./scripts/build-release.sh $(VERSION)
+	goreleaser release --snapshot --clean
+
+## release-check: validate the GoReleaser config
+release-check:
+	goreleaser check
 
 ## test: run unit tests
 test:
