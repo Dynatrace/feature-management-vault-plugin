@@ -18,6 +18,13 @@ import (
 var tenantPattern = regexp.MustCompile(`^[a-zA-Z0-9]{8,10}$`)
 
 // fmConfig is the stored mount configuration. A single mount serves one tenant.
+//
+// The OAuth client credentials come from one of two mutually exclusive sources:
+//   - inline: ClientID and ClientSecret are stored directly on the mount; or
+//   - sourced: ClientCredentialsPath points at a KV secret in the same Vault,
+//     and the plugin reads ClientID/ClientSecret from it at client-build time
+//     after logging in via AppRole. In sourced mode the OAuth secret never lives
+//     in this config — access is governed entirely by the AppRole's policy.
 type fmConfig struct {
 	FMBaseURL          string   `json:"fm_base_url"`
 	TokenURL           string   `json:"token_url"`
@@ -26,6 +33,50 @@ type fmConfig struct {
 	Tenant             string   `json:"dt_tenant"`
 	Scopes             []string `json:"scopes,omitempty"`
 	HTTPTimeoutSeconds int      `json:"http_timeout_seconds,omitempty"`
+
+	// Sourced-credentials fields (empty in inline mode).
+	ClientCredentialsPath string `json:"client_credentials_path,omitempty"`
+	ClientIDField         string `json:"client_id_field,omitempty"`
+	ClientSecretField     string `json:"client_secret_field,omitempty"`
+	KVVersion             int    `json:"kv_version,omitempty"`
+	VaultAddr             string `json:"vault_addr,omitempty"`
+	AuthMount             string `json:"auth_mount,omitempty"`
+	AuthRoleID            string `json:"auth_role_id,omitempty"`
+	AuthSecretID          string `json:"auth_secret_id,omitempty"`
+}
+
+// usesSourcedCredentials reports whether the OAuth client credentials are read
+// from a separate Vault KV path rather than stored inline.
+func (c *fmConfig) usesSourcedCredentials() bool {
+	return c.ClientCredentialsPath != ""
+}
+
+func (c *fmConfig) kvVersionOrDefault() int {
+	if c.KVVersion == 0 {
+		return defaultKVVersion
+	}
+	return c.KVVersion
+}
+
+func (c *fmConfig) authMountOrDefault() string {
+	if c.AuthMount == "" {
+		return defaultAuthMount
+	}
+	return c.AuthMount
+}
+
+func (c *fmConfig) clientIDFieldOrDefault() string {
+	if c.ClientIDField == "" {
+		return defaultClientIDField
+	}
+	return c.ClientIDField
+}
+
+func (c *fmConfig) clientSecretFieldOrDefault() string {
+	if c.ClientSecretField == "" {
+		return defaultClientSecretField
+	}
+	return c.ClientSecretField
 }
 
 func (c *fmConfig) toClientConfig() fmclient.Config {
@@ -71,13 +122,53 @@ func (b *backend) pathConfig() *framework.Path {
 			},
 			"client_id": {
 				Type:        framework.TypeString,
-				Description: "OAuth client ID the plugin authenticates with.",
-				Required:    true,
+				Description: "OAuth client ID the plugin authenticates with. Required unless client_credentials_path is set.",
 			},
 			"client_secret": {
 				Type:         framework.TypeString,
-				Description:  "OAuth client secret. Write-only; never returned on read.",
-				Required:     true,
+				Description:  "OAuth client secret. Write-only; never returned on read. Required unless client_credentials_path is set.",
+				DisplayAttrs: &framework.DisplayAttributes{Sensitive: true},
+			},
+			"client_credentials_path": {
+				Type: framework.TypeString,
+				Description: "Vault path of a KV secret holding the OAuth client_id/client_secret, read at " +
+					"client-build time instead of storing them inline. For KV v2 use the raw API path including " +
+					"/data/ (e.g. secret/data/dynatrace/fm); for KV v1 omit it (e.g. secret/dynatrace/fm). When set, " +
+					"client_id/client_secret must not be provided and the AppRole auth_* fields are required.",
+			},
+			"client_id_field": {
+				Type:        framework.TypeString,
+				Description: "Field name within the sourced KV secret holding the client id.",
+				Default:     defaultClientIDField,
+			},
+			"client_secret_field": {
+				Type:        framework.TypeString,
+				Description: "Field name within the sourced KV secret holding the client secret.",
+				Default:     defaultClientSecretField,
+			},
+			"kv_version": {
+				Type:        framework.TypeInt,
+				Description: "KV secrets-engine version of client_credentials_path (1 or 2).",
+				Default:     defaultKVVersion,
+			},
+			"vault_addr": {
+				Type: framework.TypeString,
+				Description: "Vault API address the plugin calls to read client_credentials_path. Defaults to the " +
+					"VAULT_ADDR in the plugin's environment. TLS is configured via the standard VAULT_CACERT / " +
+					"VAULT_CAPATH / VAULT_SKIP_VERIFY environment variables.",
+			},
+			"auth_mount": {
+				Type:        framework.TypeString,
+				Description: "Mount path of the AppRole auth method used to read client_credentials_path.",
+				Default:     defaultAuthMount,
+			},
+			"auth_role_id": {
+				Type:        framework.TypeString,
+				Description: "AppRole role_id used to authenticate to Vault when reading client_credentials_path.",
+			},
+			"auth_secret_id": {
+				Type:         framework.TypeString,
+				Description:  "AppRole secret_id. Write-only; never returned on read.",
 				DisplayAttrs: &framework.DisplayAttributes{Sensitive: true},
 			},
 			"dt_tenant": {
@@ -130,6 +221,8 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 	if v, ok := d.GetOk("token_url"); ok {
 		cfg.TokenURL = strings.TrimSpace(v.(string))
 	}
+	_, gotID := d.GetOk("client_id")
+	_, gotSecret := d.GetOk("client_secret")
 	if v, ok := d.GetOk("client_id"); ok {
 		cfg.ClientID = v.(string)
 	}
@@ -145,6 +238,30 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 	if v, ok := d.GetOk("http_timeout_seconds"); ok {
 		cfg.HTTPTimeoutSeconds = v.(int)
 	}
+	if v, ok := d.GetOk("client_credentials_path"); ok {
+		cfg.ClientCredentialsPath = strings.TrimSpace(v.(string))
+	}
+	if v, ok := d.GetOk("client_id_field"); ok {
+		cfg.ClientIDField = strings.TrimSpace(v.(string))
+	}
+	if v, ok := d.GetOk("client_secret_field"); ok {
+		cfg.ClientSecretField = strings.TrimSpace(v.(string))
+	}
+	if v, ok := d.GetOk("kv_version"); ok {
+		cfg.KVVersion = v.(int)
+	}
+	if v, ok := d.GetOk("vault_addr"); ok {
+		cfg.VaultAddr = strings.TrimSpace(v.(string))
+	}
+	if v, ok := d.GetOk("auth_mount"); ok {
+		cfg.AuthMount = strings.TrimSpace(v.(string))
+	}
+	if v, ok := d.GetOk("auth_role_id"); ok {
+		cfg.AuthRoleID = strings.TrimSpace(v.(string))
+	}
+	if v, ok := d.GetOk("auth_secret_id"); ok {
+		cfg.AuthSecretID = v.(string)
+	}
 
 	var missing []string
 	if cfg.FMBaseURL == "" {
@@ -153,14 +270,34 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 	if cfg.TokenURL == "" {
 		missing = append(missing, "token_url")
 	}
-	if cfg.ClientID == "" {
-		missing = append(missing, "client_id")
-	}
-	if cfg.ClientSecret == "" {
-		missing = append(missing, "client_secret")
-	}
 	if cfg.Tenant == "" {
 		missing = append(missing, "dt_tenant")
+	}
+	if cfg.usesSourcedCredentials() {
+		// Sourced mode: credentials live in a KV path; inline creds are rejected
+		// to avoid an ambiguous, stale secret lingering in the mount config.
+		if gotID || gotSecret {
+			return logical.ErrorResponse("client_id/client_secret must not be set when client_credentials_path is " +
+				"used; the credentials are sourced from that path"), nil
+		}
+		cfg.ClientID = ""
+		cfg.ClientSecret = ""
+		if cfg.AuthRoleID == "" {
+			missing = append(missing, "auth_role_id")
+		}
+		if cfg.AuthSecretID == "" {
+			missing = append(missing, "auth_secret_id")
+		}
+		if ver := cfg.kvVersionOrDefault(); ver != 1 && ver != 2 {
+			return logical.ErrorResponse("invalid kv_version %d: must be 1 or 2", ver), nil
+		}
+	} else {
+		if cfg.ClientID == "" {
+			missing = append(missing, "client_id")
+		}
+		if cfg.ClientSecret == "" {
+			missing = append(missing, "client_secret")
+		}
 	}
 	if len(missing) > 0 {
 		return logical.ErrorResponse("missing required config fields: %s", strings.Join(missing, ", ")), nil
@@ -226,17 +363,28 @@ func (b *backend) pathConfigRead(ctx context.Context, req *logical.Request, _ *f
 	if cfg == nil {
 		return nil, nil
 	}
-	return &logical.Response{
-		Data: map[string]interface{}{
-			"fm_base_url":          cfg.FMBaseURL,
-			"token_url":            cfg.TokenURL,
-			"client_id":            cfg.ClientID,
-			"dt_tenant":            cfg.Tenant,
-			"scopes":               cfg.scopesOrDefault(),
-			"http_timeout_seconds": cfg.HTTPTimeoutSeconds,
-			// client_secret is intentionally never returned.
-		},
-	}, nil
+	data := map[string]interface{}{
+		"fm_base_url":          cfg.FMBaseURL,
+		"token_url":            cfg.TokenURL,
+		"dt_tenant":            cfg.Tenant,
+		"scopes":               cfg.scopesOrDefault(),
+		"http_timeout_seconds": cfg.HTTPTimeoutSeconds,
+		// client_secret and auth_secret_id are intentionally never returned.
+	}
+	if cfg.usesSourcedCredentials() {
+		data["credentials_source"] = "vault_kv"
+		data["client_credentials_path"] = cfg.ClientCredentialsPath
+		data["client_id_field"] = cfg.clientIDFieldOrDefault()
+		data["client_secret_field"] = cfg.clientSecretFieldOrDefault()
+		data["kv_version"] = cfg.kvVersionOrDefault()
+		data["vault_addr"] = cfg.VaultAddr
+		data["auth_mount"] = cfg.authMountOrDefault()
+		data["auth_role_id"] = cfg.AuthRoleID
+	} else {
+		data["credentials_source"] = "inline"
+		data["client_id"] = cfg.ClientID
+	}
+	return &logical.Response{Data: data}, nil
 }
 
 func (b *backend) pathConfigDelete(ctx context.Context, req *logical.Request, _ *framework.FieldData) (*logical.Response, error) {
