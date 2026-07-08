@@ -25,9 +25,10 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
-  # Only runs on the push that creates a release: cross-compile and attach the
-  # archives + checksums to that release.
-  build-release:
+  # Only runs on the push that creates a release: GoReleaser cross-compiles the
+  # binaries and uploads the archives + checksums to the release that
+  # release-please just created (release.mode: keep-existing).
+  goreleaser:
     name: Build & upload release assets
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
@@ -36,13 +37,18 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Check out the tag release-please created so GoReleaser derives the
+          # version from it; full history is needed for tag resolution.
+          ref: ${{ needs.release-please.outputs.tag_name }}
+          fetch-depth: 0
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
-      - name: Build release archives
-        run: ./scripts/build-release.sh "${{ needs.release-please.outputs.tag_name }}"
-      - name: Upload assets to the GitHub release
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/* --clobber
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

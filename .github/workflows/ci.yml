@@ -36,12 +36,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
-      # Verification only: runs the same packaging script the release uses so a
-      # broken cross-compile or archive step fails the PR. The throwaway archives
-      # are not uploaded — real release artifacts come from release.yml.
-      - name: Verify cross-compile & packaging
-        run: ./scripts/build-release.sh 0.0.0-ci
+      # Verification only: a snapshot release runs the same GoReleaser pipeline
+      # used for real releases (build + archive + checksum) without publishing,
+      # so a broken cross-compile or packaging step fails the PR.
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean

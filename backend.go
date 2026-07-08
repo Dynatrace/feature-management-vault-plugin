@@ -46,6 +46,9 @@ type backend struct {
 	// coordLocks serializes read-modify-write on a coordinate's current-key
 	// record, preventing a double-mint race.
 	coordLocks []*locksutil.LockEntry
+
+	// metrics are the OpenTelemetry instruments for the SDK-key lifecycle.
+	metrics *metrics
 }
 
 // Factory builds the backend for the Vault plugin runtime.
@@ -63,6 +66,7 @@ func newBackend() *backend {
 		clientFactory: func(cfg fmclient.Config) (fmclient.FMClient, error) {
 			return fmclient.New(cfg)
 		},
+		metrics: newDefaultMetrics(),
 	}
 
 	b.Backend = &framework.Backend{
