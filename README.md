@@ -39,14 +39,14 @@ rotate path ──▶ createSdkKey (new) + tombstone old (deleted after rotation
 
 ## Plugin paths
 
-| Path                                                | Verb              | Purpose                                                                                                             |
-|-----------------------------------------------------|-------------------|---------------------------------------------------------------------------------------------------------------------|
-| `config`                                            | write/read/delete | FM base URL, OAuth client (`client_id`/`client_secret`/`token_url`), `dt_tenant`.                                   |
-| `roles/<name>`                                      | write/read/delete | Policy template: `ttl`, `max_ttl`, `rotation_grace`, optional `project_key`/`release_stage_key`/`type` constraints. |
-| `roles`                                             | list              | List roles.                                                                                                         |
-| `<version>/<release-stage>/<project>/<type>`        | read              | Read (lazily mint) the current key for a coordinate; issues a lease.                                                |
-| `rotate/<version>/<release-stage>/<project>/<type>` | write             | Force a rotation (new key now; old deleted after `rotation_grace`).                                                 |
-| `reconcile`                                         | write             | Clear stale current keys and report/optionally delete orphaned FM keys.                                             |
+| Path                                                | Verb              | Purpose                                                                                                                                                                                                                                                              |
+|-----------------------------------------------------|-------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `config`                                            | write/read/delete | FM base URL, `token_url`, `dt_tenant`, and the OAuth client credentials — either inline (`client_id`/`client_secret`) or, preferably, sourced from a Vault KV path (`client_credentials_path` + AppRole). See [OAuth client credentials](#oauth-client-credentials). |
+| `roles/<name>`                                      | write/read/delete | Policy template: `ttl`, `max_ttl`, `rotation_grace`, optional `project_key`/`release_stage_key`/`type` constraints.                                                                                                                                                  |
+| `roles`                                             | list              | List roles.                                                                                                                                                                                                                                                          |
+| `<version>/<release-stage>/<project>/<type>`        | read              | Read (lazily mint) the current key for a coordinate; issues a lease.                                                                                                                                                                                                 |
+| `rotate/<version>/<release-stage>/<project>/<type>` | write             | Force a rotation (new key now; old deleted after `rotation_grace`).                                                                                                                                                                                                  |
+| `reconcile`                                         | write             | Clear stale current keys and report/optionally delete orphaned FM keys.                                                                                                                                                                                              |
 
 `<version>` is the SDK-key **format** version (the `dtNN` token, e.g. `dt01`), not
 an API or plugin version. Every coordinate element is a path segment so Vault
@@ -167,6 +167,57 @@ Dynatrace SSO token endpoint, requesting scopes
 refreshed. The plugin is the only component that holds the privileged FM
 credential; consumers only ever see minted SDK keys. The full SDK key secret is
 never logged — only the public prefix (`{token}.{platform}_{geo}_{publicRandom}`).
+
+### OAuth client credentials
+
+The OAuth client credentials the plugin authenticates with can be supplied in one
+of two ways. **Sourced credentials are preferred** for anything beyond local
+experiments — the OAuth secret then never lives in this mount's config and its
+access is governed entirely by an AppRole policy.
+
+- **Sourced (preferred):** `client_credentials_path` points at a KV secret in the
+  same Vault holding the `client_id`/`client_secret`. The plugin logs in with the
+  configured AppRole (`auth_role_id`/`auth_secret_id`) and reads that secret at
+  client-build time, so the OAuth secret is never stored on the mount and can be
+  rotated in one place. The short-lived AppRole token is revoked immediately after
+  the read.
+
+  ```sh
+  vault write feature-management/config \
+    fm_base_url=https://<host>/platform/feature-management/v0.1 \
+    token_url=https://<sso-host>/sso/oauth2/token \
+    dt_tenant=tenantxxx \
+    client_credentials_path=secret/data/dynatrace/fm \
+    auth_role_id=<role-id> auth_secret_id=<secret-id>
+  ```
+
+  Optional fields: `client_id_field`/`client_secret_field` (KV field names,
+  default `client_id`/`client_secret`), `kv_version` (`1` or `2`, default `2` —
+  for KV v2 include `/data/` in the path), `auth_mount` (default `approle`), and
+  `vault_addr` (defaults to the plugin's `VAULT_ADDR`; TLS via the standard
+  `VAULT_CACERT`/`VAULT_CAPATH`/`VAULT_SKIP_VERIFY` env vars).
+
+- **Inline:** `client_id`/`client_secret` are stored directly on the mount.
+  Simplest for local/mock runs, but the secret then lives in the mount config.
+
+  ```sh
+  vault write feature-management/config \
+    fm_base_url=… token_url=… dt_tenant=tenantxxx \
+    client_id=<id> client_secret=<secret>
+  ```
+
+**Switching between the two is a plain config write and never errors.** The mode
+is chosen from what the request supplies, and the other mode's fields are cleared
+so no stale secret lingers:
+
+- Writing `client_credentials_path` selects sourced mode and **takes precedence** —
+  if the same request also carries `client_id`/`client_secret`, those are ignored,
+  cleared, and a warning is returned.
+- Writing `client_id`/`client_secret` *without* a path selects inline mode and
+  clears all sourced fields (`client_credentials_path`, the `auth_*` fields, etc.).
+
+`client_secret` and `auth_secret_id` are write-only and never returned on read;
+`config` read reports `credentials_source` as `inline` or `vault_kv`.
 
 ## Memory locking (mlock)
 

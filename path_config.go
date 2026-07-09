@@ -19,12 +19,18 @@ var tenantPattern = regexp.MustCompile(`^[a-zA-Z0-9]{8,10}$`)
 
 // fmConfig is the stored mount configuration. A single mount serves one tenant.
 //
-// The OAuth client credentials come from one of two mutually exclusive sources:
+// The OAuth client credentials come from one of two sources, and a mount can be
+// swapped between them at any time by writing the fields of the desired source:
 //   - inline: ClientID and ClientSecret are stored directly on the mount; or
 //   - sourced: ClientCredentialsPath points at a KV secret in the same Vault,
 //     and the plugin reads ClientID/ClientSecret from it at client-build time
 //     after logging in via AppRole. In sourced mode the OAuth secret never lives
 //     in this config — access is governed entirely by the AppRole's policy.
+//
+// The two sources never coexist in storage: a write that sets
+// ClientCredentialsPath selects sourced mode (and takes precedence over inline
+// fields in the same request), while a write that sets ClientID/ClientSecret
+// without a path selects inline mode. The losing source's fields are cleared.
 type fmConfig struct {
 	FMBaseURL          string   `json:"fm_base_url"`
 	TokenURL           string   `json:"token_url"`
@@ -49,6 +55,21 @@ type fmConfig struct {
 // from a separate Vault KV path rather than stored inline.
 func (c *fmConfig) usesSourcedCredentials() bool {
 	return c.ClientCredentialsPath != ""
+}
+
+// clearSourcedCredentials drops every sourced-mode (Vault KV / AppRole) field so
+// the mount reverts cleanly to inline credentials. Clearing ClientCredentialsPath
+// makes usesSourcedCredentials report false; the remaining fields are wiped to
+// avoid leaving stale, confusing values (notably the AppRole secret_id) behind.
+func (c *fmConfig) clearSourcedCredentials() {
+	c.ClientCredentialsPath = ""
+	c.ClientIDField = ""
+	c.ClientSecretField = ""
+	c.KVVersion = 0
+	c.VaultAddr = ""
+	c.AuthMount = ""
+	c.AuthRoleID = ""
+	c.AuthSecretID = ""
 }
 
 func (c *fmConfig) kvVersionOrDefault() int {
@@ -133,8 +154,10 @@ func (b *backend) pathConfig() *framework.Path {
 				Type: framework.TypeString,
 				Description: "Vault path of a KV secret holding the OAuth client_id/client_secret, read at " +
 					"client-build time instead of storing them inline. For KV v2 use the raw API path including " +
-					"/data/ (e.g. secret/data/dynatrace/fm); for KV v1 omit it (e.g. secret/dynatrace/fm). When set, " +
-					"client_id/client_secret must not be provided and the AppRole auth_* fields are required.",
+					"/data/ (e.g. secret/data/dynatrace/fm); for KV v1 omit it (e.g. secret/dynatrace/fm). Setting " +
+					"this selects sourced mode and requires the AppRole auth_* fields; it takes precedence over and " +
+					"clears any client_id/client_secret. Clear it (and set client_id/client_secret) to switch back " +
+					"to inline mode.",
 			},
 			"client_id_field": {
 				Type:        framework.TypeString,
@@ -238,6 +261,7 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 	if v, ok := d.GetOk("http_timeout_seconds"); ok {
 		cfg.HTTPTimeoutSeconds = v.(int)
 	}
+	_, gotCredsPath := d.GetOk("client_credentials_path")
 	if v, ok := d.GetOk("client_credentials_path"); ok {
 		cfg.ClientCredentialsPath = strings.TrimSpace(v.(string))
 	}
@@ -263,6 +287,31 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 		cfg.AuthSecretID = v.(string)
 	}
 
+	// Resolve the credentials mode from what this request supplies, so a mount can
+	// be freely swapped between inline and sourced credentials without erroring
+	// and without the previous mode's fields lingering in storage. A request that
+	// supplies client_credentials_path selects sourced mode and takes precedence;
+	// otherwise supplying client_id/client_secret selects inline mode. Either way
+	// the losing mode's fields are wiped so no stale secret is left behind.
+	var credSwapWarning string
+	gotInlineCreds := gotID || gotSecret
+	switch {
+	case gotCredsPath:
+		// Sourced mode: drop any inline credentials so no stale OAuth secret
+		// lingers. If the same request also carried inline creds, they lose to the
+		// KV path; warn rather than error so a swap never fails.
+		if gotInlineCreds {
+			credSwapWarning = "client_id/client_secret were ignored and cleared because client_credentials_path " +
+				"selects sourced credentials"
+		}
+		cfg.ClientID = ""
+		cfg.ClientSecret = ""
+	case gotInlineCreds:
+		// Inline mode: drop the sourced configuration so the mount stops resolving
+		// credentials from Vault KV.
+		cfg.clearSourcedCredentials()
+	}
+
 	var missing []string
 	if cfg.FMBaseURL == "" {
 		missing = append(missing, "fm_base_url")
@@ -274,14 +323,6 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 		missing = append(missing, "dt_tenant")
 	}
 	if cfg.usesSourcedCredentials() {
-		// Sourced mode: credentials live in a KV path; inline creds are rejected
-		// to avoid an ambiguous, stale secret lingering in the mount config.
-		if gotID || gotSecret {
-			return logical.ErrorResponse("client_id/client_secret must not be set when client_credentials_path is " +
-				"used; the credentials are sourced from that path"), nil
-		}
-		cfg.ClientID = ""
-		cfg.ClientSecret = ""
 		if cfg.AuthRoleID == "" {
 			missing = append(missing, "auth_role_id")
 		}
@@ -315,12 +356,21 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 	b.resetClient()
 
 	// Flag the common foot-gun of a deployed mount still pointing at a local
-	// test/mock FM service (e.g. config copied from the demo).
+	// test/mock FM service (e.g. config copied from the demo), plus any
+	// credentials-mode swap that discarded conflicting fields.
 	var resp *logical.Response
+	addWarning := func(msg string) {
+		if resp == nil {
+			resp = &logical.Response{}
+		}
+		resp.AddWarning(msg)
+	}
 	if loopback := loopbackURLs(cfg.FMBaseURL, cfg.TokenURL); len(loopback) > 0 {
-		resp = &logical.Response{}
-		resp.AddWarning("config points at a loopback address (" + strings.Join(loopback, ", ") +
+		addWarning("config points at a loopback address (" + strings.Join(loopback, ", ") +
 			"); this only reaches a local/mock FM service and will fail on a deployed Vault")
+	}
+	if credSwapWarning != "" {
+		addWarning(credSwapWarning)
 	}
 	return resp, nil
 }

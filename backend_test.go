@@ -207,11 +207,102 @@ func TestConfig_SourcedCredentials_WriteReadRedacts(t *testing.T) {
 	}
 }
 
-func TestConfig_SourcedCredentials_RejectsInlineClientFields(t *testing.T) {
+func TestConfig_SourcedCredentials_InlineFieldsLoseToPath(t *testing.T) {
 	b, _, s := testBackend(t)
+	// Supplying both sources in one request must not error: client_credentials_path
+	// takes precedence, the inline creds are cleared, and a warning is returned.
 	resp := writeSourcedConfig(t, b, s, map[string]interface{}{"client_id": "id", "client_secret": "secret"})
-	require.True(t, resp.IsError(), "combining client_id with client_credentials_path must error")
-	require.Contains(t, resp.Error().Error(), "must not be set")
+	require.False(t, resp.IsError(), "combining client_id with client_credentials_path must not error: %v", resp)
+	require.NotEmpty(t, resp.Warnings, "expected a warning about the ignored inline credentials")
+	require.Contains(t, resp.Warnings[0], "client_credentials_path")
+
+	cfg, err := b.readConfig(context.Background(), s)
+	require.NoError(t, err)
+	require.True(t, cfg.usesSourcedCredentials())
+	require.Empty(t, cfg.ClientID, "inline client_id must be cleared")
+	require.Empty(t, cfg.ClientSecret, "inline client_secret must be cleared")
+}
+
+// writeInlineConfig writes a minimal inline-credentials config, merging extra.
+func writeInlineConfig(t *testing.T, b *backend, s logical.Storage, extra map[string]interface{}) *logical.Response {
+	t.Helper()
+	data := map[string]interface{}{
+		"fm_base_url":   "https://fm.example.com/public/feature-management-service/v0.1",
+		"token_url":     "https://sso.example.com/sso/oauth2/token",
+		"dt_tenant":     "tenant1234",
+		"client_id":     "inline-id",
+		"client_secret": "inline-secret",
+	}
+	for k, v := range extra {
+		data[k] = v
+	}
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation, Path: "config", Storage: s, Data: data,
+	})
+	require.NoError(t, err)
+	return resp
+}
+
+func TestConfig_SwitchSourcedToInline(t *testing.T) {
+	b, _, s := testBackend(t)
+
+	// Start sourced (AppRole + KV path).
+	require.False(t, writeSourcedConfig(t, b, s, nil).IsError())
+
+	// Switch to inline by providing only client_id/client_secret. This must not
+	// error even though the stored config still carried the sourced fields.
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.UpdateOperation, Path: "config", Storage: s,
+		Data: map[string]interface{}{"client_id": "inline-id", "client_secret": "inline-secret"},
+	})
+	require.NoError(t, err)
+	require.False(t, resp.IsError(), "switching sourced->inline must not error: %v", resp)
+
+	cfg, err := b.readConfig(context.Background(), s)
+	require.NoError(t, err)
+	require.False(t, cfg.usesSourcedCredentials(), "mount must no longer be in sourced mode")
+	require.Equal(t, "inline-id", cfg.ClientID)
+	require.Equal(t, "inline-secret", cfg.ClientSecret)
+	// Every sourced field must be wiped so no stale AppRole secret_id lingers.
+	require.Empty(t, cfg.ClientCredentialsPath)
+	require.Empty(t, cfg.AuthRoleID)
+	require.Empty(t, cfg.AuthSecretID)
+	require.Empty(t, cfg.VaultAddr)
+	require.Zero(t, cfg.KVVersion)
+
+	// Read reports inline mode.
+	readResp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation, Path: "config", Storage: s,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "inline", readResp.Data["credentials_source"])
+}
+
+func TestConfig_SwitchInlineToSourced(t *testing.T) {
+	b, _, s := testBackend(t)
+
+	// Start inline.
+	require.False(t, writeInlineConfig(t, b, s, nil).IsError())
+
+	// Switch to sourced by providing the KV path + AppRole fields.
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.UpdateOperation, Path: "config", Storage: s,
+		Data: map[string]interface{}{
+			"client_credentials_path": "secret/data/dynatrace/fm",
+			"auth_role_id":            "role-123",
+			"auth_secret_id":          "secret-456",
+		},
+	})
+	require.NoError(t, err)
+	require.False(t, resp.IsError(), "switching inline->sourced must not error: %v", resp)
+
+	cfg, err := b.readConfig(context.Background(), s)
+	require.NoError(t, err)
+	require.True(t, cfg.usesSourcedCredentials(), "mount must be in sourced mode")
+	// Inline credentials must be dropped.
+	require.Empty(t, cfg.ClientID)
+	require.Empty(t, cfg.ClientSecret)
+	require.Equal(t, "secret/data/dynatrace/fm", cfg.ClientCredentialsPath)
 }
 
 func TestConfig_SourcedCredentials_RequiresAppRoleFields(t *testing.T) {
