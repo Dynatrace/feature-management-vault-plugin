@@ -72,7 +72,7 @@ func newBackend() *backend {
 			return fmclient.New(cfg)
 		},
 		resolveCreds: resolveAppRoleCredentials,
-		metrics: newDefaultMetrics(),
+		metrics:      newDefaultMetrics(),
 	}
 
 	b.Backend = &framework.Backend{
