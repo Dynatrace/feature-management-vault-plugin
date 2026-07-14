@@ -19,6 +19,11 @@ func testBackend(t *testing.T) (*backend, *fmclienttest.Fake, logical.Storage) {
 	fake := fmclienttest.New()
 	b := newBackend()
 	b.clientFactory = func(_ fmclient.Config) (fmclient.FMClient, error) { return fake, nil }
+	// Fail loudly if a test reaches the real AppRole resolver (which would dial
+	// Vault); tests that exercise sourced credentials override this explicitly.
+	b.resolveCreds = func(context.Context, *fmConfig) (string, string, error) {
+		return "", "", errors.New("resolveCreds not stubbed for this test")
+	}
 
 	cfg := &logical.BackendConfig{
 		Logger:      hclog.NewNullLogger(),
@@ -156,6 +161,216 @@ func TestConfig_InvalidTenant(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.True(t, resp.IsError())
+}
+
+func writeSourcedConfig(t *testing.T, b *backend, s logical.Storage, extra map[string]interface{}) *logical.Response {
+	t.Helper()
+	data := map[string]interface{}{
+		"fm_base_url":             "https://fm.example.com/public/feature-management-service/v0.1",
+		"token_url":               "https://sso.example.com/sso/oauth2/token",
+		"dt_tenant":               "tenant1234",
+		"client_credentials_path": "secret/data/dynatrace/fm",
+		"auth_role_id":            "role-123",
+		"auth_secret_id":          "secret-456",
+	}
+	for k, v := range extra {
+		data[k] = v
+	}
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation, Path: "config", Storage: s, Data: data,
+	})
+	require.NoError(t, err)
+	return resp
+}
+
+func TestConfig_SourcedCredentials_WriteReadRedacts(t *testing.T) {
+	b, _, s := testBackend(t)
+	resp := writeSourcedConfig(t, b, s, nil)
+	require.False(t, resp.IsError(), "sourced config write error: %v", resp)
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation, Path: "config", Storage: s,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "vault_kv", resp.Data["credentials_source"])
+	require.Equal(t, "secret/data/dynatrace/fm", resp.Data["client_credentials_path"])
+	require.Equal(t, "role-123", resp.Data["auth_role_id"])
+	require.Equal(t, "approle", resp.Data["auth_mount"])
+	require.Equal(t, 2, resp.Data["kv_version"])
+	require.Equal(t, "client_id", resp.Data["client_id_field"])
+
+	// Neither the OAuth secret nor the AppRole secret_id is ever returned, and
+	// no inline client_id leaks in sourced mode.
+	for _, k := range []string{"client_secret", "auth_secret_id", "client_id"} {
+		_, ok := resp.Data[k]
+		require.False(t, ok, "%s must never be returned", k)
+	}
+}
+
+func TestConfig_SourcedCredentials_InlineFieldsLoseToPath(t *testing.T) {
+	b, _, s := testBackend(t)
+	// Supplying both sources in one request must not error: client_credentials_path
+	// takes precedence, the inline creds are cleared, and a warning is returned.
+	resp := writeSourcedConfig(t, b, s, map[string]interface{}{"client_id": "id", "client_secret": "secret"})
+	require.False(t, resp.IsError(), "combining client_id with client_credentials_path must not error: %v", resp)
+	require.NotEmpty(t, resp.Warnings, "expected a warning about the ignored inline credentials")
+	require.Contains(t, resp.Warnings[0], "client_credentials_path")
+
+	cfg, err := b.readConfig(context.Background(), s)
+	require.NoError(t, err)
+	require.True(t, cfg.usesSourcedCredentials())
+	require.Empty(t, cfg.ClientID, "inline client_id must be cleared")
+	require.Empty(t, cfg.ClientSecret, "inline client_secret must be cleared")
+}
+
+// writeInlineConfig writes a minimal inline-credentials config, merging extra.
+func writeInlineConfig(t *testing.T, b *backend, s logical.Storage, extra map[string]interface{}) *logical.Response {
+	t.Helper()
+	data := map[string]interface{}{
+		"fm_base_url":   "https://fm.example.com/public/feature-management-service/v0.1",
+		"token_url":     "https://sso.example.com/sso/oauth2/token",
+		"dt_tenant":     "tenant1234",
+		"client_id":     "inline-id",
+		"client_secret": "inline-secret",
+	}
+	for k, v := range extra {
+		data[k] = v
+	}
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation, Path: "config", Storage: s, Data: data,
+	})
+	require.NoError(t, err)
+	return resp
+}
+
+func TestConfig_SwitchSourcedToInline(t *testing.T) {
+	b, _, s := testBackend(t)
+
+	// Start sourced (AppRole + KV path).
+	require.False(t, writeSourcedConfig(t, b, s, nil).IsError())
+
+	// Switch to inline by providing only client_id/client_secret. This must not
+	// error even though the stored config still carried the sourced fields.
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.UpdateOperation, Path: "config", Storage: s,
+		Data: map[string]interface{}{"client_id": "inline-id", "client_secret": "inline-secret"},
+	})
+	require.NoError(t, err)
+	require.False(t, resp.IsError(), "switching sourced->inline must not error: %v", resp)
+
+	cfg, err := b.readConfig(context.Background(), s)
+	require.NoError(t, err)
+	require.False(t, cfg.usesSourcedCredentials(), "mount must no longer be in sourced mode")
+	require.Equal(t, "inline-id", cfg.ClientID)
+	require.Equal(t, "inline-secret", cfg.ClientSecret)
+	// Every sourced field must be wiped so no stale AppRole secret_id lingers.
+	require.Empty(t, cfg.ClientCredentialsPath)
+	require.Empty(t, cfg.AuthRoleID)
+	require.Empty(t, cfg.AuthSecretID)
+	require.Empty(t, cfg.VaultAddr)
+	require.Zero(t, cfg.KVVersion)
+
+	// Read reports inline mode.
+	readResp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation, Path: "config", Storage: s,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "inline", readResp.Data["credentials_source"])
+}
+
+func TestConfig_SwitchInlineToSourced(t *testing.T) {
+	b, _, s := testBackend(t)
+
+	// Start inline.
+	require.False(t, writeInlineConfig(t, b, s, nil).IsError())
+
+	// Switch to sourced by providing the KV path + AppRole fields.
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.UpdateOperation, Path: "config", Storage: s,
+		Data: map[string]interface{}{
+			"client_credentials_path": "secret/data/dynatrace/fm",
+			"auth_role_id":            "role-123",
+			"auth_secret_id":          "secret-456",
+		},
+	})
+	require.NoError(t, err)
+	require.False(t, resp.IsError(), "switching inline->sourced must not error: %v", resp)
+
+	cfg, err := b.readConfig(context.Background(), s)
+	require.NoError(t, err)
+	require.True(t, cfg.usesSourcedCredentials(), "mount must be in sourced mode")
+	// Inline credentials must be dropped.
+	require.Empty(t, cfg.ClientID)
+	require.Empty(t, cfg.ClientSecret)
+	require.Equal(t, "secret/data/dynatrace/fm", cfg.ClientCredentialsPath)
+}
+
+func TestConfig_SourcedCredentials_RequiresAppRoleFields(t *testing.T) {
+	b, _, s := testBackend(t)
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation, Path: "config", Storage: s,
+		Data: map[string]interface{}{
+			"fm_base_url":             "https://fm.example.com/x",
+			"token_url":               "https://sso.example.com/t",
+			"dt_tenant":               "tenant1234",
+			"client_credentials_path": "secret/data/dynatrace/fm",
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, resp.IsError())
+	require.Contains(t, resp.Error().Error(), "auth_role_id")
+	require.Contains(t, resp.Error().Error(), "auth_secret_id")
+}
+
+func TestConfig_SourcedCredentials_RejectsBadKVVersion(t *testing.T) {
+	b, _, s := testBackend(t)
+	resp := writeSourcedConfig(t, b, s, map[string]interface{}{"kv_version": 3})
+	require.True(t, resp.IsError())
+	require.Contains(t, resp.Error().Error(), "kv_version")
+}
+
+func TestGetClient_SourcedCredentialsFlowIntoClient(t *testing.T) {
+	b, fake, s := testBackend(t)
+
+	var gotCfg fmclient.Config
+	b.clientFactory = func(c fmclient.Config) (fmclient.FMClient, error) {
+		gotCfg = c
+		return fake, nil
+	}
+	var resolveCalls int
+	b.resolveCreds = func(_ context.Context, cfg *fmConfig) (string, string, error) {
+		resolveCalls++
+		require.Equal(t, "secret/data/dynatrace/fm", cfg.ClientCredentialsPath)
+		require.Equal(t, "role-123", cfg.AuthRoleID)
+		require.Equal(t, "secret-456", cfg.AuthSecretID)
+		return "resolved-id", "resolved-secret", nil
+	}
+
+	require.False(t, writeSourcedConfig(t, b, s, nil).IsError())
+
+	_, err := b.getClient(context.Background(), s)
+	require.NoError(t, err)
+	require.Equal(t, 1, resolveCalls)
+	require.Equal(t, "resolved-id", gotCfg.ClientID)
+	require.Equal(t, "resolved-secret", gotCfg.ClientSecret)
+
+	// Cached: a second getClient does not re-resolve.
+	_, err = b.getClient(context.Background(), s)
+	require.NoError(t, err)
+	require.Equal(t, 1, resolveCalls)
+}
+
+func TestGetClient_SourcedCredentialsResolveError(t *testing.T) {
+	b, _, s := testBackend(t)
+	b.resolveCreds = func(context.Context, *fmConfig) (string, string, error) {
+		return "", "", errors.New("approle login: permission denied")
+	}
+	require.False(t, writeSourcedConfig(t, b, s, nil).IsError())
+
+	_, err := b.getClient(context.Background(), s)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "resolve client credentials")
+	require.Contains(t, err.Error(), "permission denied")
 }
 
 func TestRole_ResolveMostSpecific(t *testing.T) {

@@ -43,6 +43,11 @@ type backend struct {
 	// clientFactory builds an FM client from config; overridable in tests.
 	clientFactory func(fmclient.Config) (fmclient.FMClient, error)
 
+	// resolveCreds reads the OAuth client credentials from a separate Vault KV
+	// path when the mount is configured for sourced credentials; overridable in
+	// tests.
+	resolveCreds func(ctx context.Context, cfg *fmConfig) (clientID, clientSecret string, err error)
+
 	// coordLocks serializes read-modify-write on a coordinate's current-key
 	// record, preventing a double-mint race.
 	coordLocks []*locksutil.LockEntry
@@ -66,7 +71,8 @@ func newBackend() *backend {
 		clientFactory: func(cfg fmclient.Config) (fmclient.FMClient, error) {
 			return fmclient.New(cfg)
 		},
-		metrics: newDefaultMetrics(),
+		resolveCreds: resolveAppRoleCredentials,
+		metrics:      newDefaultMetrics(),
 	}
 
 	b.Backend = &framework.Backend{
@@ -122,7 +128,16 @@ func (b *backend) getClient(ctx context.Context, s logical.Storage) (fmclient.FM
 	if cfg == nil {
 		return nil, fmt.Errorf("backend is not configured; write %q first", storageConfig)
 	}
-	client, err := b.clientFactory(cfg.toClientConfig())
+	clientCfg := cfg.toClientConfig()
+	if cfg.usesSourcedCredentials() {
+		id, secret, err := b.resolveCreds(ctx, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("resolve client credentials from %q: %w", cfg.ClientCredentialsPath, err)
+		}
+		clientCfg.ClientID = id
+		clientCfg.ClientSecret = secret
+	}
+	client, err := b.clientFactory(clientCfg)
 	if err != nil {
 		return nil, fmt.Errorf("build FM client: %w", err)
 	}
