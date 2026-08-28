@@ -48,6 +48,10 @@ type backend struct {
 	// tests.
 	resolveCreds func(ctx context.Context, cfg *fmConfig) (clientID, clientSecret string, err error)
 
+	// resolveWorkingCreds obtains or creates the short-lived IDM OAuth2 working
+	// client the plugin uses to authenticate to the FM API; overridable in tests.
+	resolveWorkingCreds func(ctx context.Context, s logical.Storage, cfg *fmConfig, superID, superSecret string) (clientID, clientSecret string, err error)
+
 	// coordLocks serializes read-modify-write on a coordinate's current-key
 	// record, preventing a double-mint race.
 	coordLocks []*locksutil.LockEntry
@@ -74,6 +78,7 @@ func newBackend() *backend {
 		resolveCreds: resolveAppRoleCredentials,
 		metrics:      newDefaultMetrics(),
 	}
+	b.resolveWorkingCreds = b.defaultResolveWorkingCreds
 
 	b.Backend = &framework.Backend{
 		Help:        backendHelp,
@@ -81,6 +86,7 @@ func newBackend() *backend {
 		PathsSpecial: &logical.Paths{
 			SealWrapStorage: []string{
 				storageConfig,
+				storageWorkingClient,
 				"role/*",
 				"current/*",
 				"tombstone/*",
@@ -128,15 +134,26 @@ func (b *backend) getClient(ctx context.Context, s logical.Storage) (fmclient.FM
 	if cfg == nil {
 		return nil, fmt.Errorf("backend is not configured; write %q first", storageConfig)
 	}
+
+	// Resolve super-client credentials (inline or KV-sourced).
 	clientCfg := cfg.toClientConfig()
+	superID, superSecret := clientCfg.ClientID, clientCfg.ClientSecret
 	if cfg.usesSourcedCredentials() {
 		id, secret, err := b.resolveCreds(ctx, cfg)
 		if err != nil {
 			return nil, fmt.Errorf("resolve client credentials from %q: %w", cfg.ClientCredentialsPath, err)
 		}
-		clientCfg.ClientID = id
-		clientCfg.ClientSecret = secret
+		superID, superSecret = id, secret
 	}
+
+	// Obtain the short-lived working client (created or rotated via IDM API).
+	workingID, workingSecret, err := b.resolveWorkingCreds(ctx, s, cfg, superID, superSecret)
+	if err != nil {
+		return nil, fmt.Errorf("resolve working client: %w", err)
+	}
+	clientCfg.ClientID = workingID
+	clientCfg.ClientSecret = workingSecret
+
 	client, err := b.clientFactory(clientCfg)
 	if err != nil {
 		return nil, fmt.Errorf("build FM client: %w", err)

@@ -1,6 +1,7 @@
-// Command mock-fm-server is a tiny stand-in for the Feature Management Service
-// and the Dynatrace SSO token endpoint, for local end-to-end testing of the
-// plugin without real credentials. It is NOT for production use.
+// Command mock-fm-server is a tiny stand-in for the Feature Management Service,
+// the Dynatrace IDM API, and the Dynatrace SSO token endpoint, for local
+// end-to-end testing of the plugin without real credentials. It is NOT for
+// production use.
 //
 // Example:
 //
@@ -11,6 +12,9 @@
 //	vault write feature-management/config \
 //	  fm_base_url=http://127.0.0.1:8899/public/feature-management-service/v0.1 \
 //	  token_url=http://127.0.0.1:8899/sso/oauth2/token \
+//	  idm_base_url=http://127.0.0.1:8899/idm \
+//	  client_template_id=mock-template \
+//	  client_id_prefix=dt0s00000001. \
 //	  client_id=mock client_secret=mock dt_tenant=tenantxxx
 package main
 
@@ -40,6 +44,36 @@ func main() {
 			"expires_in":   3600,
 		})
 	})
+
+	// IDM: create working client from template.
+	mux.HandleFunc("POST /idm/v1/oauth2-client-template/{templateId}/client",
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") == "" {
+				writeErr(w, http.StatusUnauthorized, "missing bearer token")
+				return
+			}
+			var body struct {
+				ClientID string `json:"clientId"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeErr(w, http.StatusBadRequest, "invalid body")
+				return
+			}
+			writeJSON(w, http.StatusCreated, map[string]string{
+				"clientId":     body.ClientID,
+				"clientSecret": "mock-working-client-secret",
+			})
+		})
+
+	// IDM: delete working client.
+	mux.HandleFunc("DELETE /idm/v1/oauth2-client/{clientId}/owner",
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") == "" {
+				writeErr(w, http.StatusUnauthorized, "missing bearer token")
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		})
 
 	mux.HandleFunc("POST "+apiBase+"/projects/{project}/release-stages/{stage}/sdk-keys",
 		func(w http.ResponseWriter, r *http.Request) {

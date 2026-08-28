@@ -40,6 +40,12 @@ type fmConfig struct {
 	Scopes             []string `json:"scopes,omitempty"`
 	HTTPTimeoutSeconds int      `json:"http_timeout_seconds,omitempty"`
 
+	// IDM fields — required for OAuth2 working-client create/delete via the Dynatrace IDM API.
+	IDMBaseURL                 string `json:"idm_base_url,omitempty"`
+	ClientTemplateID           string `json:"client_template_id,omitempty"`
+	ClientIDPrefix             string `json:"client_id_prefix,omitempty"`
+	WorkingClientRotationHours int    `json:"working_client_rotation_hours,omitempty"`
+
 	// Sourced-credentials fields (empty in inline mode).
 	ClientCredentialsPath string `json:"client_credentials_path,omitempty"`
 	ClientIDField         string `json:"client_id_field,omitempty"`
@@ -145,6 +151,22 @@ func (b *backend) pathConfig() *framework.Path {
 				Type:        framework.TypeString,
 				Description: "OAuth client ID the plugin authenticates with. Required unless client_credentials_path is set.",
 			},
+			"idm_base_url": {
+				Type: framework.TypeString,
+				Description: "Base URL of the Dynatrace IDM API including the /idm path prefix " +
+					"(e.g. https://sso.dynatracelabs.com/idm). Required for OAuth2 client create/delete.",
+			},
+			"client_template_id": {
+				Type: framework.TypeString,
+				Description: "IDM OAuth2 client template ID used when creating new credentials " +
+					"(the {client_template_id} path segment in createClientFromClientTemplate).",
+			},
+			"client_id_prefix": {
+				Type: framework.TypeString,
+				Description: "Account-specific Dynatrace service-principal prefix prepended to a random " +
+					"suffix to form each new OAuth2 client ID. Must match the pattern dt0s[0-9]+\\. " +
+					"(e.g. dt0s01234567.).",
+			},
 			"client_secret": {
 				Type:         framework.TypeString,
 				Description:  "OAuth client secret. Write-only; never returned on read. Required unless client_credentials_path is set.",
@@ -208,6 +230,11 @@ func (b *backend) pathConfig() *framework.Path {
 				Description: "HTTP timeout for FM API calls, in seconds.",
 				Default:     30,
 			},
+			"working_client_rotation_hours": {
+				Type:        framework.TypeInt,
+				Description: "How long a working OAuth2 client credential is used before rotation, in hours (default 23).",
+				Default:     23,
+			},
 		},
 		Operations: map[logical.Operation]framework.OperationHandler{
 			logical.CreateOperation: &framework.PathOperation{Callback: b.pathConfigWrite},
@@ -244,6 +271,15 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 	if v, ok := d.GetOk("token_url"); ok {
 		cfg.TokenURL = strings.TrimSpace(v.(string))
 	}
+	if v, ok := d.GetOk("idm_base_url"); ok {
+		cfg.IDMBaseURL = strings.TrimRight(strings.TrimSpace(v.(string)), "/")
+	}
+	if v, ok := d.GetOk("client_template_id"); ok {
+		cfg.ClientTemplateID = strings.TrimSpace(v.(string))
+	}
+	if v, ok := d.GetOk("client_id_prefix"); ok {
+		cfg.ClientIDPrefix = strings.TrimSpace(v.(string))
+	}
 	_, gotID := d.GetOk("client_id")
 	_, gotSecret := d.GetOk("client_secret")
 	if v, ok := d.GetOk("client_id"); ok {
@@ -260,6 +296,9 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 	}
 	if v, ok := d.GetOk("http_timeout_seconds"); ok {
 		cfg.HTTPTimeoutSeconds = v.(int)
+	}
+	if v, ok := d.GetOk("working_client_rotation_hours"); ok {
+		cfg.WorkingClientRotationHours = v.(int)
 	}
 	_, gotCredsPath := d.GetOk("client_credentials_path")
 	if v, ok := d.GetOk("client_credentials_path"); ok {
@@ -340,6 +379,15 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 			missing = append(missing, "client_secret")
 		}
 	}
+	if cfg.IDMBaseURL == "" {
+		missing = append(missing, "idm_base_url")
+	}
+	if cfg.ClientTemplateID == "" {
+		missing = append(missing, "client_template_id")
+	}
+	if cfg.ClientIDPrefix == "" {
+		missing = append(missing, "client_id_prefix")
+	}
 	if len(missing) > 0 {
 		return logical.ErrorResponse("missing required config fields: %s", strings.Join(missing, ", ")), nil
 	}
@@ -414,11 +462,15 @@ func (b *backend) pathConfigRead(ctx context.Context, req *logical.Request, _ *f
 		return nil, nil
 	}
 	data := map[string]interface{}{
-		"fm_base_url":          cfg.FMBaseURL,
-		"token_url":            cfg.TokenURL,
-		"dt_tenant":            cfg.Tenant,
-		"scopes":               cfg.scopesOrDefault(),
-		"http_timeout_seconds": cfg.HTTPTimeoutSeconds,
+		"fm_base_url":                   cfg.FMBaseURL,
+		"token_url":                     cfg.TokenURL,
+		"dt_tenant":                     cfg.Tenant,
+		"scopes":                        cfg.scopesOrDefault(),
+		"http_timeout_seconds":          cfg.HTTPTimeoutSeconds,
+		"idm_base_url":                  cfg.IDMBaseURL,
+		"client_template_id":            cfg.ClientTemplateID,
+		"client_id_prefix":              cfg.ClientIDPrefix,
+		"working_client_rotation_hours": cfg.workingClientRotationHoursOrDefault(),
 		// client_secret and auth_secret_id are intentionally never returned.
 	}
 	if cfg.usesSourcedCredentials() {

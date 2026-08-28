@@ -85,6 +85,9 @@ func (b *backend) periodicFunc(ctx context.Context, req *logical.Request) error 
 	if b.isStandby() {
 		return nil
 	}
+
+	b.rotateWorkingClientIfDue(ctx, req.Storage)
+
 	tombs, err := b.listTombstones(ctx, req.Storage)
 	if err != nil {
 		return err

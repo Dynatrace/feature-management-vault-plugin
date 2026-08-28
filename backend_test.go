@@ -24,6 +24,10 @@ func testBackend(t *testing.T) (*backend, *fmclienttest.Fake, logical.Storage) {
 	b.resolveCreds = func(context.Context, *fmConfig) (string, string, error) {
 		return "", "", errors.New("resolveCreds not stubbed for this test")
 	}
+	// Bypass IDM API calls; tests that exercise working-client rotation override this.
+	b.resolveWorkingCreds = func(_ context.Context, _ logical.Storage, _ *fmConfig, _, _ string) (string, string, error) {
+		return "working-id", "working-secret", nil
+	}
 
 	cfg := &logical.BackendConfig{
 		Logger:      hclog.NewNullLogger(),
@@ -41,11 +45,14 @@ func writeConfig(t *testing.T, b *backend, s logical.Storage) {
 		Path:      "config",
 		Storage:   s,
 		Data: map[string]interface{}{
-			"fm_base_url":   "http://fm.example/public/feature-management-service/v0.1",
-			"token_url":     "http://sso.example/token",
-			"client_id":     "id",
-			"client_secret": "secret",
-			"dt_tenant":     "tenant1234",
+			"fm_base_url":        "http://fm.example/public/feature-management-service/v0.1",
+			"token_url":          "http://sso.example/token",
+			"client_id":          "id",
+			"client_secret":      "secret",
+			"dt_tenant":          "tenant1234",
+			"idm_base_url":       "http://idm.example",
+			"client_template_id": "template-abc",
+			"client_id_prefix":   "dt0s01.",
 		},
 	})
 	require.NoError(t, err)
@@ -115,6 +122,7 @@ func TestConfig_LoopbackWarning(t *testing.T) {
 			"fm_base_url": "http://127.0.0.1:8899/public/feature-management-service/v0.1",
 			"token_url":   "http://localhost:8899/sso/oauth2/token",
 			"client_id":   "id", "client_secret": "secret", "dt_tenant": "tenant1234",
+			"idm_base_url": "http://idm.example", "client_template_id": "tmpl", "client_id_prefix": "dt0s01.",
 		},
 	})
 	require.NoError(t, err)
@@ -157,6 +165,7 @@ func TestConfig_InvalidTenant(t *testing.T) {
 		Data: map[string]interface{}{
 			"fm_base_url": "http://x/y", "token_url": "http://x/t",
 			"client_id": "id", "client_secret": "secret", "dt_tenant": "bad!",
+			"idm_base_url": "http://idm.example", "client_template_id": "tmpl", "client_id_prefix": "dt0s01.",
 		},
 	})
 	require.NoError(t, err)
@@ -172,6 +181,9 @@ func writeSourcedConfig(t *testing.T, b *backend, s logical.Storage, extra map[s
 		"client_credentials_path": "secret/data/dynatrace/fm",
 		"auth_role_id":            "role-123",
 		"auth_secret_id":          "secret-456",
+		"idm_base_url":            "http://idm.example",
+		"client_template_id":      "template-abc",
+		"client_id_prefix":        "dt0s01.",
 	}
 	for k, v := range extra {
 		data[k] = v
@@ -227,11 +239,14 @@ func TestConfig_SourcedCredentials_InlineFieldsLoseToPath(t *testing.T) {
 func writeInlineConfig(t *testing.T, b *backend, s logical.Storage, extra map[string]interface{}) *logical.Response {
 	t.Helper()
 	data := map[string]interface{}{
-		"fm_base_url":   "https://fm.example.com/public/feature-management-service/v0.1",
-		"token_url":     "https://sso.example.com/sso/oauth2/token",
-		"dt_tenant":     "tenant1234",
-		"client_id":     "inline-id",
-		"client_secret": "inline-secret",
+		"fm_base_url":        "https://fm.example.com/public/feature-management-service/v0.1",
+		"token_url":          "https://sso.example.com/sso/oauth2/token",
+		"dt_tenant":          "tenant1234",
+		"client_id":          "inline-id",
+		"client_secret":      "inline-secret",
+		"idm_base_url":       "http://idm.example",
+		"client_template_id": "template-abc",
+		"client_id_prefix":   "dt0s01.",
 	}
 	for k, v := range extra {
 		data[k] = v
@@ -314,6 +329,9 @@ func TestConfig_SourcedCredentials_RequiresAppRoleFields(t *testing.T) {
 			"token_url":               "https://sso.example.com/t",
 			"dt_tenant":               "tenant1234",
 			"client_credentials_path": "secret/data/dynatrace/fm",
+			"idm_base_url":            "http://idm.example",
+			"client_template_id":      "template-abc",
+			"client_id_prefix":        "dt0s01.",
 		},
 	})
 	require.NoError(t, err)
@@ -345,14 +363,25 @@ func TestGetClient_SourcedCredentialsFlowIntoClient(t *testing.T) {
 		require.Equal(t, "secret-456", cfg.AuthSecretID)
 		return "resolved-id", "resolved-secret", nil
 	}
+	// Capture super-client creds passed to resolveWorkingCreds to verify resolved
+	// credentials flow through, then return working-client creds for the FM client.
+	var gotSuperID, gotSuperSecret string
+	b.resolveWorkingCreds = func(_ context.Context, _ logical.Storage, _ *fmConfig, superID, superSecret string) (string, string, error) {
+		gotSuperID, gotSuperSecret = superID, superSecret
+		return "working-id", "working-secret", nil
+	}
 
 	require.False(t, writeSourcedConfig(t, b, s, nil).IsError())
 
 	_, err := b.getClient(context.Background(), s)
 	require.NoError(t, err)
 	require.Equal(t, 1, resolveCalls)
-	require.Equal(t, "resolved-id", gotCfg.ClientID)
-	require.Equal(t, "resolved-secret", gotCfg.ClientSecret)
+	// Super-client credentials must be passed to the working-client resolver.
+	require.Equal(t, "resolved-id", gotSuperID)
+	require.Equal(t, "resolved-secret", gotSuperSecret)
+	// Working client credentials (not super-client) reach the FM client factory.
+	require.Equal(t, "working-id", gotCfg.ClientID)
+	require.Equal(t, "working-secret", gotCfg.ClientSecret)
 
 	// Cached: a second getClient does not re-resolve.
 	_, err = b.getClient(context.Background(), s)
