@@ -65,9 +65,11 @@ func resolveAppRoleCredentials(ctx context.Context, cfg *fmConfig) (clientID, cl
 	return clientID, clientSecret, nil
 }
 
-// newVaultAPIClient builds a Vault API client from the plugin environment,
-// overriding the address with cfg.VaultAddr when set. The returned client
-// carries no token; the caller authenticates it via AppRole.
+// newVaultAPIClient builds a Vault API client for the sourced-credentials
+// Vault installation. The base config comes from the plugin environment
+// (VAULT_ADDR, VAULT_CACERT, VAULT_SKIP_VERIFY); per-mount overrides in cfg
+// take precedence, enabling connections to a remote Vault with its own TLS CA
+// or enterprise namespace.
 func newVaultAPIClient(cfg *fmConfig) (*api.Client, error) {
 	apiCfg := api.DefaultConfig()
 	if apiCfg.Error != nil {
@@ -76,6 +78,20 @@ func newVaultAPIClient(cfg *fmConfig) (*api.Client, error) {
 	if cfg.VaultAddr != "" {
 		apiCfg.Address = cfg.VaultAddr
 	}
+
+	// Apply per-mount TLS overrides so a remote Vault with a privately-signed
+	// certificate works without touching the plugin process's environment.
+	tlsCfg := &api.TLSConfig{}
+	if cfg.VaultCACert != "" {
+		tlsCfg.CACertBytes = []byte(cfg.VaultCACert)
+	}
+	if cfg.VaultTLSSkipVerify {
+		tlsCfg.Insecure = true
+	}
+	if err := apiCfg.ConfigureTLS(tlsCfg); err != nil {
+		return nil, fmt.Errorf("configure vault tls: %w", err)
+	}
+
 	client, err := api.NewClient(apiCfg)
 	if err != nil {
 		return nil, fmt.Errorf("create vault client: %w", err)
@@ -83,6 +99,9 @@ func newVaultAPIClient(cfg *fmConfig) (*api.Client, error) {
 	// Ensure no ambient token (e.g. VAULT_TOKEN) is used; the AppRole login
 	// governs access to the credentials path.
 	client.SetToken("")
+	if cfg.VaultNamespace != "" {
+		client.SetNamespace(cfg.VaultNamespace)
+	}
 	return client, nil
 }
 

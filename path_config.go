@@ -22,10 +22,11 @@ var tenantPattern = regexp.MustCompile(`^[a-zA-Z0-9]{8,10}$`)
 // The OAuth client credentials come from one of two sources, and a mount can be
 // swapped between them at any time by writing the fields of the desired source:
 //   - inline: ClientID and ClientSecret are stored directly on the mount; or
-//   - sourced: ClientCredentialsPath points at a KV secret in the same Vault,
-//     and the plugin reads ClientID/ClientSecret from it at client-build time
-//     after logging in via AppRole. In sourced mode the OAuth secret never lives
-//     in this config — access is governed entirely by the AppRole's policy.
+//   - sourced: ClientCredentialsPath points at a KV secret in a Vault
+//     installation (local or remote), and the plugin reads ClientID/ClientSecret
+//     from it at client-build time after logging in via AppRole. In sourced mode
+//     the OAuth secret never lives in this config — access is governed entirely
+//     by the AppRole's policy.
 //
 // The two sources never coexist in storage: a write that sets
 // ClientCredentialsPath selects sourced mode (and takes precedence over inline
@@ -46,6 +47,9 @@ type fmConfig struct {
 	ClientSecretField     string `json:"client_secret_field,omitempty"`
 	KVVersion             int    `json:"kv_version,omitempty"`
 	VaultAddr             string `json:"vault_addr,omitempty"`
+	VaultNamespace        string `json:"vault_namespace,omitempty"`
+	VaultCACert           string `json:"vault_ca_cert,omitempty"`
+	VaultTLSSkipVerify    bool   `json:"vault_tls_skip_verify,omitempty"`
 	AuthMount             string `json:"auth_mount,omitempty"`
 	AuthRoleID            string `json:"auth_role_id,omitempty"`
 	AuthSecretID          string `json:"auth_secret_id,omitempty"`
@@ -67,6 +71,9 @@ func (c *fmConfig) clearSourcedCredentials() {
 	c.ClientSecretField = ""
 	c.KVVersion = 0
 	c.VaultAddr = ""
+	c.VaultNamespace = ""
+	c.VaultCACert = ""
+	c.VaultTLSSkipVerify = false
 	c.AuthMount = ""
 	c.AuthRoleID = ""
 	c.AuthSecretID = ""
@@ -176,9 +183,28 @@ func (b *backend) pathConfig() *framework.Path {
 			},
 			"vault_addr": {
 				Type: framework.TypeString,
-				Description: "Vault API address the plugin calls to read client_credentials_path. Defaults to the " +
-					"VAULT_ADDR in the plugin's environment. TLS is configured via the standard VAULT_CACERT / " +
-					"VAULT_CAPATH / VAULT_SKIP_VERIFY environment variables.",
+				Description: "Vault API address the plugin calls to read client_credentials_path (e.g. " +
+					"https://vault.example.com:8200). Defaults to VAULT_ADDR in the plugin's environment. " +
+					"Set this to target a remote Vault installation.",
+			},
+			"vault_namespace": {
+				Type: framework.TypeString,
+				Description: "Vault namespace to use when reading client_credentials_path. Required for " +
+					"remote Vault Enterprise installations that use namespaces (e.g. admin/team). Leave " +
+					"empty for Vault OSS or the root namespace.",
+			},
+			"vault_ca_cert": {
+				Type: framework.TypeString,
+				Description: "PEM-encoded CA certificate (or certificate chain) used to verify the remote " +
+					"Vault server's TLS certificate. Required when vault_addr points at a Vault with a " +
+					"privately-signed certificate and the CA is not in the plugin's system trust store. " +
+					"Takes precedence over the VAULT_CACERT environment variable for this mount.",
+			},
+			"vault_tls_skip_verify": {
+				Type: framework.TypeBool,
+				Description: "If true, TLS certificate verification is disabled when connecting to the " +
+					"Vault at vault_addr. Intended for development/testing only; do not set in production.",
+				Default: false,
 			},
 			"auth_mount": {
 				Type:        framework.TypeString,
@@ -276,6 +302,15 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 	}
 	if v, ok := d.GetOk("vault_addr"); ok {
 		cfg.VaultAddr = strings.TrimSpace(v.(string))
+	}
+	if v, ok := d.GetOk("vault_namespace"); ok {
+		cfg.VaultNamespace = strings.TrimSpace(v.(string))
+	}
+	if v, ok := d.GetOk("vault_ca_cert"); ok {
+		cfg.VaultCACert = strings.TrimSpace(v.(string))
+	}
+	if v, ok := d.GetOk("vault_tls_skip_verify"); ok {
+		cfg.VaultTLSSkipVerify = v.(bool)
 	}
 	if v, ok := d.GetOk("auth_mount"); ok {
 		cfg.AuthMount = strings.TrimSpace(v.(string))
@@ -428,6 +463,8 @@ func (b *backend) pathConfigRead(ctx context.Context, req *logical.Request, _ *f
 		data["client_secret_field"] = cfg.clientSecretFieldOrDefault()
 		data["kv_version"] = cfg.kvVersionOrDefault()
 		data["vault_addr"] = cfg.VaultAddr
+		data["vault_namespace"] = cfg.VaultNamespace
+		data["vault_tls_skip_verify"] = cfg.VaultTLSSkipVerify
 		data["auth_mount"] = cfg.authMountOrDefault()
 		data["auth_role_id"] = cfg.AuthRoleID
 	} else {

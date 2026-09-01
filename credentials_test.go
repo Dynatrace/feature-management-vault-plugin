@@ -15,13 +15,14 @@ import (
 // an AppRole login, a KV read, and revoke-self. It records requests so tests
 // can assert on the flow.
 type fakeVault struct {
-	roleID       string
-	secretID     string
-	token        string
-	kvPath       string // API path (without the /v1 prefix), e.g. "secret/data/dynatrace/fm"
-	kvPayload    map[string]interface{}
-	loginStatus  int // override the login response status; 0 => 200
-	revokedCalls int32
+	roleID        string
+	secretID      string
+	token         string
+	kvPath        string // API path (without the /v1 prefix), e.g. "secret/data/dynatrace/fm"
+	kvPayload     map[string]interface{}
+	loginStatus   int    // override the login response status; 0 => 200
+	wantNamespace string // assert X-Vault-Namespace header when set
+	revokedCalls  int32
 }
 
 func (f *fakeVault) server(t *testing.T) *httptest.Server {
@@ -31,6 +32,9 @@ func (f *fakeVault) server(t *testing.T) *httptest.Server {
 		if f.loginStatus != 0 {
 			http.Error(w, `{"errors":["permission denied"]}`, f.loginStatus)
 			return
+		}
+		if f.wantNamespace != "" {
+			require.Equal(t, f.wantNamespace, r.Header.Get("X-Vault-Namespace"))
 		}
 		var body struct {
 			RoleID   string `json:"role_id"`
@@ -49,6 +53,9 @@ func (f *fakeVault) server(t *testing.T) *httptest.Server {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/v1/"+f.kvPath, func(w http.ResponseWriter, r *http.Request) {
+		if f.wantNamespace != "" {
+			require.Equal(t, f.wantNamespace, r.Header.Get("X-Vault-Namespace"))
+		}
 		require.Equal(t, f.token, r.Header.Get("X-Vault-Token"))
 		writeJSON(w, map[string]interface{}{"data": f.kvPayload})
 	})
@@ -211,6 +218,66 @@ func TestResolveAppRoleCredentials_WrongKVVersionForPayload(t *testing.T) {
 	_, _, err := resolveAppRoleCredentials(context.Background(), cfg)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "kv_version")
+}
+
+func TestResolveAppRoleCredentials_Namespace(t *testing.T) {
+	fv := &fakeVault{
+		roleID:        "role-123",
+		secretID:      "secret-456",
+		token:         "s.login-token",
+		kvPath:        "secret/data/dynatrace/fm",
+		wantNamespace: "admin/teamA",
+		kvPayload: map[string]interface{}{
+			"data": map[string]interface{}{
+				"client_id":     "ns-id",
+				"client_secret": "ns-secret",
+			},
+		},
+	}
+	srv := fv.server(t)
+
+	cfg := &fmConfig{
+		ClientCredentialsPath: "secret/data/dynatrace/fm",
+		AuthRoleID:            "role-123",
+		AuthSecretID:          "secret-456",
+		VaultAddr:             srv.URL,
+		VaultNamespace:        "admin/teamA",
+	}
+	id, secret, err := resolveAppRoleCredentials(context.Background(), cfg)
+	require.NoError(t, err)
+	require.Equal(t, "ns-id", id)
+	require.Equal(t, "ns-secret", secret)
+}
+
+func TestResolveAppRoleCredentials_TLSSkipVerify(t *testing.T) {
+	// Serve over plain HTTP but with skip_verify set — the flag must not prevent
+	// the connection (here it just confirms the flag is wired through without
+	// causing a build-time panic or config error).
+	fv := &fakeVault{
+		roleID:   "role-123",
+		secretID: "secret-456",
+		token:    "s.login-token",
+		kvPath:   "secret/data/dynatrace/fm",
+		kvPayload: map[string]interface{}{
+			"data": map[string]interface{}{
+				"client_id":     "tls-id",
+				"client_secret": "tls-secret",
+			},
+		},
+	}
+	srv := fv.server(t)
+
+	cfg := &fmConfig{
+		ClientCredentialsPath: "secret/data/dynatrace/fm",
+		AuthRoleID:            "role-123",
+		AuthSecretID:          "secret-456",
+		VaultAddr:             srv.URL,
+		VaultTLSSkipVerify:    true,
+	}
+	id, secret, err := resolveAppRoleCredentials(context.Background(), cfg)
+	require.NoError(t, err)
+	require.Equal(t, "tls-id", id)
+	require.Equal(t, "tls-secret", secret)
 }
 
 func TestStringField(t *testing.T) {
