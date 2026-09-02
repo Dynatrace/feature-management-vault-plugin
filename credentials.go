@@ -3,6 +3,7 @@ package featuremanagement
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/hashicorp/vault/api"
@@ -10,8 +11,14 @@ import (
 
 // Defaults for the sourced-credentials (Vault KV) configuration fields.
 const (
-	// defaultAuthMount is the conventional mount path of the AppRole auth method.
+	// defaultAuthMethod is the auth method used when auth_method is not set.
+	defaultAuthMethod = "approle"
+	// defaultAuthMount is the conventional mount path for AppRole auth.
 	defaultAuthMount = "approle"
+	// defaultKubernetesMount is the conventional mount path for Kubernetes auth.
+	defaultKubernetesMount = "kubernetes"
+	// defaultJWTPath is the standard Kubernetes service account token path.
+	defaultJWTPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	// defaultKVVersion is the KV secrets-engine version assumed for
 	// client_credentials_path when unset (KV v2 is the modern default).
 	defaultKVVersion = 2
@@ -21,25 +28,30 @@ const (
 	defaultClientSecretField = "client_secret"
 )
 
-// resolveAppRoleCredentials logs in to Vault with the configured AppRole and
-// reads the OAuth client_id/client_secret from the KV secret at
-// cfg.ClientCredentialsPath. It is the production implementation behind
-// backend.resolveCreds; tests stub that field so this never dials Vault.
-//
-// The Vault address and TLS settings come from the plugin's environment
-// (VAULT_ADDR / VAULT_CACERT / VAULT_CAPATH / VAULT_SKIP_VERIFY), overridable
-// per-mount via cfg.VaultAddr. The short-lived token minted by the login is
-// revoked before returning so it does not linger in Vault.
-func resolveAppRoleCredentials(ctx context.Context, cfg *fmConfig) (clientID, clientSecret string, err error) {
+// resolveSourcedCredentials is the production implementation behind
+// backend.resolveCreds. It builds a Vault client, authenticates using the
+// configured auth method (AppRole or Kubernetes), reads the OAuth
+// client_id/client_secret from the KV secret at cfg.ClientCredentialsPath, and
+// revokes the short-lived login token before returning.
+func resolveSourcedCredentials(ctx context.Context, cfg *fmConfig) (clientID, clientSecret string, err error) {
 	client, err := newVaultAPIClient(cfg)
 	if err != nil {
 		return "", "", err
 	}
 
-	token, err := appRoleLogin(ctx, client, cfg)
+	var token string
+	switch cfg.authMethodOrDefault() {
+	case "approle":
+		token, err = loginViaAppRole(ctx, client, cfg)
+	case "kubernetes":
+		token, err = loginViaKubernetes(ctx, client, cfg)
+	default:
+		return "", "", fmt.Errorf("unsupported auth_method %q", cfg.AuthMethod)
+	}
 	if err != nil {
 		return "", "", err
 	}
+
 	client.SetToken(token)
 	// Best-effort cleanup: the resolved credentials are all we need, so the
 	// login token should not outlive this call.
@@ -96,8 +108,8 @@ func newVaultAPIClient(cfg *fmConfig) (*api.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create vault client: %w", err)
 	}
-	// Ensure no ambient token (e.g. VAULT_TOKEN) is used; the AppRole login
-	// governs access to the credentials path.
+	// Ensure no ambient token (e.g. VAULT_TOKEN) is used; the configured auth
+	// method governs access to the credentials path.
 	client.SetToken("")
 	if cfg.VaultNamespace != "" {
 		client.SetNamespace(cfg.VaultNamespace)
@@ -105,9 +117,9 @@ func newVaultAPIClient(cfg *fmConfig) (*api.Client, error) {
 	return client, nil
 }
 
-// appRoleLogin performs a role_id/secret_id login against the configured
+// loginViaAppRole performs a role_id/secret_id login against the configured
 // AppRole mount and returns the resulting client token.
-func appRoleLogin(ctx context.Context, client *api.Client, cfg *fmConfig) (string, error) {
+func loginViaAppRole(ctx context.Context, client *api.Client, cfg *fmConfig) (string, error) {
 	mount := strings.Trim(cfg.authMountOrDefault(), "/")
 	loginPath := fmt.Sprintf("auth/%s/login", mount)
 	secret, err := client.Logical().WriteWithContext(ctx, loginPath, map[string]interface{}{
@@ -119,6 +131,31 @@ func appRoleLogin(ctx context.Context, client *api.Client, cfg *fmConfig) (strin
 	}
 	if secret == nil || secret.Auth == nil || secret.Auth.ClientToken == "" {
 		return "", fmt.Errorf("approle login at %q returned no client token", loginPath)
+	}
+	return secret.Auth.ClientToken, nil
+}
+
+// loginViaKubernetes reads the pod's service account JWT from cfg.AuthJWTPath
+// (defaulting to the standard Kubernetes projected token path) and performs a
+// Vault Kubernetes auth login, returning the resulting client token.
+func loginViaKubernetes(ctx context.Context, client *api.Client, cfg *fmConfig) (string, error) {
+	jwtPath := cfg.jwtPathOrDefault()
+	jwtBytes, err := os.ReadFile(jwtPath)
+	if err != nil {
+		return "", fmt.Errorf("read kubernetes service account token from %q: %w", jwtPath, err)
+	}
+
+	mount := strings.Trim(cfg.authMountOrDefault(), "/")
+	loginPath := fmt.Sprintf("auth/%s/login", mount)
+	secret, err := client.Logical().WriteWithContext(ctx, loginPath, map[string]interface{}{
+		"role": cfg.AuthKubernetesRole,
+		"jwt":  string(jwtBytes),
+	})
+	if err != nil {
+		return "", fmt.Errorf("kubernetes login at %q: %w", loginPath, err)
+	}
+	if secret == nil || secret.Auth == nil || secret.Auth.ClientToken == "" {
+		return "", fmt.Errorf("kubernetes login at %q returned no client token", loginPath)
 	}
 	return secret.Auth.ClientToken, nil
 }

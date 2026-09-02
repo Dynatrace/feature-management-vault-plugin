@@ -71,7 +71,7 @@ func newBackend() *backend {
 		clientFactory: func(cfg fmclient.Config) (fmclient.FMClient, error) {
 			return fmclient.New(cfg)
 		},
-		resolveCreds: resolveAppRoleCredentials,
+		resolveCreds: resolveSourcedCredentials,
 		metrics:      newDefaultMetrics(),
 	}
 
