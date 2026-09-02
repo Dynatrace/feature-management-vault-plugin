@@ -22,10 +22,11 @@ var tenantPattern = regexp.MustCompile(`^[a-zA-Z0-9]{8,10}$`)
 // The OAuth client credentials come from one of two sources, and a mount can be
 // swapped between them at any time by writing the fields of the desired source:
 //   - inline: ClientID and ClientSecret are stored directly on the mount; or
-//   - sourced: ClientCredentialsPath points at a KV secret in the same Vault,
-//     and the plugin reads ClientID/ClientSecret from it at client-build time
-//     after logging in via AppRole. In sourced mode the OAuth secret never lives
-//     in this config — access is governed entirely by the AppRole's policy.
+//   - sourced: ClientCredentialsPath points at a KV secret in a Vault
+//     installation (local or remote), and the plugin reads ClientID/ClientSecret
+//     from it at client-build time after logging in via AppRole. In sourced mode
+//     the OAuth secret never lives in this config — access is governed entirely
+//     by the AppRole's policy.
 //
 // The two sources never coexist in storage: a write that sets
 // ClientCredentialsPath selects sourced mode (and takes precedence over inline
@@ -46,9 +47,17 @@ type fmConfig struct {
 	ClientSecretField     string `json:"client_secret_field,omitempty"`
 	KVVersion             int    `json:"kv_version,omitempty"`
 	VaultAddr             string `json:"vault_addr,omitempty"`
+	VaultNamespace        string `json:"vault_namespace,omitempty"`
+	VaultCACert           string `json:"vault_ca_cert,omitempty"`
+	VaultTLSSkipVerify    bool   `json:"vault_tls_skip_verify,omitempty"`
+	AuthMethod            string `json:"auth_method,omitempty"`
 	AuthMount             string `json:"auth_mount,omitempty"`
-	AuthRoleID            string `json:"auth_role_id,omitempty"`
-	AuthSecretID          string `json:"auth_secret_id,omitempty"`
+	// AppRole auth fields.
+	AuthRoleID   string `json:"auth_role_id,omitempty"`
+	AuthSecretID string `json:"auth_secret_id,omitempty"`
+	// Kubernetes auth fields.
+	AuthKubernetesRole string `json:"auth_kubernetes_role,omitempty"`
+	AuthJWTPath        string `json:"auth_jwt_path,omitempty"`
 }
 
 // usesSourcedCredentials reports whether the OAuth client credentials are read
@@ -67,9 +76,15 @@ func (c *fmConfig) clearSourcedCredentials() {
 	c.ClientSecretField = ""
 	c.KVVersion = 0
 	c.VaultAddr = ""
+	c.VaultNamespace = ""
+	c.VaultCACert = ""
+	c.VaultTLSSkipVerify = false
+	c.AuthMethod = ""
 	c.AuthMount = ""
 	c.AuthRoleID = ""
 	c.AuthSecretID = ""
+	c.AuthKubernetesRole = ""
+	c.AuthJWTPath = ""
 }
 
 func (c *fmConfig) kvVersionOrDefault() int {
@@ -79,11 +94,28 @@ func (c *fmConfig) kvVersionOrDefault() int {
 	return c.KVVersion
 }
 
-func (c *fmConfig) authMountOrDefault() string {
-	if c.AuthMount == "" {
-		return defaultAuthMount
+func (c *fmConfig) authMethodOrDefault() string {
+	if c.AuthMethod == "" {
+		return defaultAuthMethod
 	}
-	return c.AuthMount
+	return c.AuthMethod
+}
+
+func (c *fmConfig) authMountOrDefault() string {
+	if c.AuthMount != "" {
+		return c.AuthMount
+	}
+	if c.authMethodOrDefault() == "kubernetes" {
+		return defaultKubernetesMount
+	}
+	return defaultAuthMount
+}
+
+func (c *fmConfig) jwtPathOrDefault() string {
+	if c.AuthJWTPath == "" {
+		return defaultJWTPath
+	}
+	return c.AuthJWTPath
 }
 
 func (c *fmConfig) clientIDFieldOrDefault() string {
@@ -176,23 +208,61 @@ func (b *backend) pathConfig() *framework.Path {
 			},
 			"vault_addr": {
 				Type: framework.TypeString,
-				Description: "Vault API address the plugin calls to read client_credentials_path. Defaults to the " +
-					"VAULT_ADDR in the plugin's environment. TLS is configured via the standard VAULT_CACERT / " +
-					"VAULT_CAPATH / VAULT_SKIP_VERIFY environment variables.",
+				Description: "Vault API address the plugin calls to read client_credentials_path (e.g. " +
+					"https://vault.example.com:8200). Defaults to VAULT_ADDR in the plugin's environment. " +
+					"Set this to target a remote Vault installation.",
+			},
+			"vault_namespace": {
+				Type: framework.TypeString,
+				Description: "Vault namespace to use when reading client_credentials_path. Required for " +
+					"remote Vault Enterprise installations that use namespaces (e.g. admin/team). Leave " +
+					"empty for Vault OSS or the root namespace.",
+			},
+			"vault_ca_cert": {
+				Type: framework.TypeString,
+				Description: "PEM-encoded CA certificate (or certificate chain) used to verify the remote " +
+					"Vault server's TLS certificate. Required when vault_addr points at a Vault with a " +
+					"privately-signed certificate and the CA is not in the plugin's system trust store. " +
+					"Takes precedence over the VAULT_CACERT environment variable for this mount.",
+			},
+			"vault_tls_skip_verify": {
+				Type: framework.TypeBool,
+				Description: "If true, TLS certificate verification is disabled when connecting to the " +
+					"Vault at vault_addr. Intended for development/testing only; do not set in production.",
+				Default: false,
+			},
+			"auth_method": {
+				Type: framework.TypeString,
+				Description: "Authentication method the plugin uses to log in to the sourced-credentials Vault. " +
+					"Accepted values: \"approle\" (default) or \"kubernetes\". " +
+					"\"approle\" requires auth_role_id and auth_secret_id; " +
+					"\"kubernetes\" requires auth_kubernetes_role and uses the pod's service account JWT.",
+				Default: defaultAuthMethod,
 			},
 			"auth_mount": {
-				Type:        framework.TypeString,
-				Description: "Mount path of the AppRole auth method used to read client_credentials_path.",
-				Default:     defaultAuthMount,
+				Type: framework.TypeString,
+				Description: "Mount path of the auth method used to authenticate to the sourced-credentials Vault. " +
+					"Defaults to \"approle\" when auth_method is \"approle\", or \"kubernetes\" when auth_method is \"kubernetes\".",
 			},
 			"auth_role_id": {
 				Type:        framework.TypeString,
-				Description: "AppRole role_id used to authenticate to Vault when reading client_credentials_path.",
+				Description: "AppRole role_id. Required when auth_method is \"approle\".",
 			},
 			"auth_secret_id": {
 				Type:         framework.TypeString,
-				Description:  "AppRole secret_id. Write-only; never returned on read.",
+				Description:  "AppRole secret_id. Write-only; never returned on read. Required when auth_method is \"approle\".",
 				DisplayAttrs: &framework.DisplayAttributes{Sensitive: true},
+			},
+			"auth_kubernetes_role": {
+				Type:        framework.TypeString,
+				Description: "Vault role name to request when authenticating via Kubernetes auth. Required when auth_method is \"kubernetes\".",
+			},
+			"auth_jwt_path": {
+				Type: framework.TypeString,
+				Description: "Filesystem path of the Kubernetes service account JWT used for Vault Kubernetes auth login. " +
+					"Defaults to the standard projected token path (/var/run/secrets/kubernetes.io/serviceaccount/token). " +
+					"Only used when auth_method is \"kubernetes\".",
+				Default: defaultJWTPath,
 			},
 			"dt_tenant": {
 				Type:        framework.TypeString,
@@ -277,6 +347,18 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 	if v, ok := d.GetOk("vault_addr"); ok {
 		cfg.VaultAddr = strings.TrimSpace(v.(string))
 	}
+	if v, ok := d.GetOk("vault_namespace"); ok {
+		cfg.VaultNamespace = strings.TrimSpace(v.(string))
+	}
+	if v, ok := d.GetOk("vault_ca_cert"); ok {
+		cfg.VaultCACert = strings.TrimSpace(v.(string))
+	}
+	if v, ok := d.GetOk("vault_tls_skip_verify"); ok {
+		cfg.VaultTLSSkipVerify = v.(bool)
+	}
+	if v, ok := d.GetOk("auth_method"); ok {
+		cfg.AuthMethod = strings.TrimSpace(v.(string))
+	}
 	if v, ok := d.GetOk("auth_mount"); ok {
 		cfg.AuthMount = strings.TrimSpace(v.(string))
 	}
@@ -285,6 +367,12 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 	}
 	if v, ok := d.GetOk("auth_secret_id"); ok {
 		cfg.AuthSecretID = v.(string)
+	}
+	if v, ok := d.GetOk("auth_kubernetes_role"); ok {
+		cfg.AuthKubernetesRole = strings.TrimSpace(v.(string))
+	}
+	if v, ok := d.GetOk("auth_jwt_path"); ok {
+		cfg.AuthJWTPath = strings.TrimSpace(v.(string))
 	}
 
 	// Resolve the credentials mode from what this request supplies, so a mount can
@@ -323,11 +411,20 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 		missing = append(missing, "dt_tenant")
 	}
 	if cfg.usesSourcedCredentials() {
-		if cfg.AuthRoleID == "" {
-			missing = append(missing, "auth_role_id")
-		}
-		if cfg.AuthSecretID == "" {
-			missing = append(missing, "auth_secret_id")
+		switch cfg.authMethodOrDefault() {
+		case "approle":
+			if cfg.AuthRoleID == "" {
+				missing = append(missing, "auth_role_id")
+			}
+			if cfg.AuthSecretID == "" {
+				missing = append(missing, "auth_secret_id")
+			}
+		case "kubernetes":
+			if cfg.AuthKubernetesRole == "" {
+				missing = append(missing, "auth_kubernetes_role")
+			}
+		default:
+			return logical.ErrorResponse("invalid auth_method %q: must be \"approle\" or \"kubernetes\"", cfg.AuthMethod), nil
 		}
 		if ver := cfg.kvVersionOrDefault(); ver != 1 && ver != 2 {
 			return logical.ErrorResponse("invalid kv_version %d: must be 1 or 2", ver), nil
@@ -428,8 +525,18 @@ func (b *backend) pathConfigRead(ctx context.Context, req *logical.Request, _ *f
 		data["client_secret_field"] = cfg.clientSecretFieldOrDefault()
 		data["kv_version"] = cfg.kvVersionOrDefault()
 		data["vault_addr"] = cfg.VaultAddr
+		data["vault_namespace"] = cfg.VaultNamespace
+		data["vault_tls_skip_verify"] = cfg.VaultTLSSkipVerify
+		data["auth_method"] = cfg.authMethodOrDefault()
 		data["auth_mount"] = cfg.authMountOrDefault()
-		data["auth_role_id"] = cfg.AuthRoleID
+		switch cfg.authMethodOrDefault() {
+		case "approle":
+			data["auth_role_id"] = cfg.AuthRoleID
+			// auth_secret_id intentionally never returned.
+		case "kubernetes":
+			data["auth_kubernetes_role"] = cfg.AuthKubernetesRole
+			data["auth_jwt_path"] = cfg.jwtPathOrDefault()
+		}
 	} else {
 		data["credentials_source"] = "inline"
 		data["client_id"] = cfg.ClientID
