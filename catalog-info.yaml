@@ -1,0 +1,22 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: feature-management-vault-plugin
+  description: >
+    A HashiCorp Vault secrets-engine plugin that brokers SDK keys from the
+    Dynatrace Feature Management (FM) Service. Keys are minted on demand via the
+    FM API.
+  annotations:
+    backstage.io/source-location: url:https://github.com/Dynatrace/feature-management-vault-plugin
+    github.com/project-slug: Dynatrace/feature-management-vault-plugin
+  tags:
+    - go
+    - vault
+    - secrets-engine
+    - feature-management
+    - plugin
+spec:
+  type: plugin
+  lifecycle: experimental
+  owner: group:default/team-rd-sg-team-feature-management
+  system: system:default/feature-management
