@@ -8,9 +8,7 @@ Keys are **static** - there is no lease, no expiry, no rotation, and **the plugi
 never deletes anything in the FM Service**. Its whole job is to connect a
 workload's mount path to an SDK key, non-destructively.
 
-> Status: initial scaffold. Builds, unit-tests against a mocked FM service, and
-> registers/enables against a local Vault. The FM client is wired to the real
-> API contract (OpenAPI v0.1.91). See [Known limitations](#known-limitations).
+> See [Known limitations](#known-limitations).
 
 ## Architecture
 
@@ -82,26 +80,43 @@ Requires Go 1.25.7+, Vault SDK v0.25.x. Targets Vault 2.0.
 ## CI & releases
 
 CI (`.github/workflows/ci.yml`) runs on every push/PR: gofmt check, `go vet`,
-`go test -race`, and a GoReleaser snapshot build (the full release pipeline
-without publishing, so packaging breaks are caught early). Run the same checks
-locally with `make ci`.
+`go test -race`, and a multi-platform Docker build (`linux/amd64,linux/arm64`)
+without publishing — so image build breaks are caught on PRs. Run the same code
+checks locally with `make ci`.
 
-Releases are automated with [release-please](https://github.com/googleapis/release-please)
-+ [GoReleaser](https://goreleaser.com) (`.github/workflows/release.yml`), driven by
+Releases are fully automated via
+[release-please](https://github.com/googleapis/release-please)
+(`.github/workflows/release.yml`), driven by
 [Conventional Commits](https://www.conventionalcommits.org/):
 
-- `fix:` → patch, `feat:` → minor, `feat!:` / `BREAKING CHANGE:` → major (0.x bumps while pre-1.0).
-- release-please maintains a "release PR" that updates `CHANGELOG.md` and the
-  version in `.release-please-manifest.json`. Merging it tags `vX.Y.Z` and creates
-  the GitHub release.
-- On that release, GoReleaser (`.goreleaser.yaml`) cross-compiles
-  `linux/{amd64,arm64}` and `darwin/{amd64,arm64}` and uploads `…_<os>_<arch>.zip`
-  archives plus a `…_SHA256SUMS` file to the release (it keeps the
-  release-please-generated notes; it does not create its own release). The build
-  injects the tag into `main.version` via ldflags.
+- `fix:` → patch, `feat:` → minor, `feat!:` / `BREAKING CHANGE:` → major.
+- release-please maintains a "release PR" that updates `CHANGELOG.md` and
+  `.release-please-manifest.json`. Merging it tags `vX.Y.Z` and creates the
+  GitHub release.
+- On that release, the `publish` job builds a multi-platform image
+  (`linux/amd64,linux/arm64`) and pushes it to GHCR:
 
-`make release-build` runs the same GoReleaser pipeline locally as a snapshot
-(into `dist/`, no publish); `make release-check` validates `.goreleaser.yaml`.
+  ```
+  ghcr.io/dynatrace/feature-management-vault-plugin:<tag>
+  ghcr.io/dynatrace/feature-management-vault-plugin:latest
+  ```
+
+  The image contains the plugin binary, its sha256sum, and a busybox `cp`
+  binary for init-container use.
+
+### Provenance & attestations
+
+Every released image ships with two attestation layers:
+
+- **BuildKit** (`provenance: mode=max`, `sbom: true`): SLSA provenance and a
+  CycloneDX SBOM embedded in the image manifest as OCI referrers.
+- **GitHub artifact attestation** (Sigstore-signed): verifiable independently
+  with:
+
+  ```sh
+  gh attestation verify oci://ghcr.io/dynatrace/feature-management-vault-plugin:<tag> \
+    --owner Dynatrace
+  ```
 
 ## Local end-to-end
 
