@@ -12,24 +12,18 @@ import (
 	"time"
 )
 
-// FMClient is the subset of the Feature Management Service API the Vault plugin
-// uses. Keeping it as an interface lets the backend swap in a fake for tests and
-// lets the HTTP implementation be extracted into a shared SDK later.
+// FMClient is the subset of the Feature Management Service API the Vault plugin uses.
 type FMClient interface {
 	// CreateSdkKey mints a new SDK key for the given project/release-stage/type.
 	CreateSdkKey(ctx context.Context, project, releaseStage string, keyType SdkKeyType) (*SDKKeyDetails, error)
 	// ListSdkKeys returns the active keys for a release stage, grouped by type.
 	ListSdkKeys(ctx context.Context, project, releaseStage string) (*SDKKeyList, error)
-	// DeleteSdkKey deletes an SDK key. A 404 is reported as ErrNotFound so the
-	// caller can treat an already-gone key as success.
-	DeleteSdkKey(ctx context.Context, project, releaseStage, sdkKey string) error
 }
 
 // DefaultScopes are the OAuth scopes requested for SDK-key management.
 var DefaultScopes = []string{
 	"feature-management:sdk-keys:read",
 	"feature-management:sdk-keys:write",
-	"feature-management:sdk-keys:delete",
 }
 
 const defaultHTTPTimeout = 30 * time.Second
@@ -120,12 +114,6 @@ func (c *Client) ListSdkKeys(ctx context.Context, project, releaseStage string) 
 	return &out, nil
 }
 
-// DeleteSdkKey implements FMClient.
-func (c *Client) DeleteSdkKey(ctx context.Context, project, releaseStage, sdkKey string) error {
-	u := c.sdkKeysURL(project, releaseStage) + "/" + url.PathEscape(sdkKey)
-	return c.do(ctx, http.MethodDelete, u, nil, http.StatusNoContent, nil)
-}
-
 // do performs an authenticated request and decodes a successful response into
 // out (if non-nil). It retries once on a 401 after refreshing the token.
 func (c *Client) do(ctx context.Context, method, urlStr string, body []byte, wantStatus int, out interface{}) error {
@@ -153,7 +141,7 @@ func (c *Client) do(ctx context.Context, method, urlStr string, body []byte, wan
 
 		resp, err := c.http.Do(req)
 		if err != nil {
-			return fmt.Errorf("fmclient: %s %s: %w", method, redactURL(urlStr), err)
+			return fmt.Errorf("fmclient: %s %s: %w", method, urlStr, err)
 		}
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
@@ -173,13 +161,4 @@ func (c *Client) do(ctx context.Context, method, urlStr string, body []byte, wan
 		return nil
 	}
 	return fmt.Errorf("fmclient: unauthorized after token refresh")
-}
-
-// redactURL strips the (secret) sdk-key path segment so URLs are safe to log.
-func redactURL(u string) string {
-	const marker = "/sdk-keys/"
-	if i := strings.Index(u, marker); i >= 0 {
-		return u[:i+len(marker)] + "<redacted>"
-	}
-	return u
 }

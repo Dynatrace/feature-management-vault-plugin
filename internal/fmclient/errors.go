@@ -7,15 +7,11 @@ import (
 	"net/http"
 )
 
-// ErrNotFound is returned when the FM API responds 404. Callers deleting a key
-// should treat not-found as success (the key is already gone — e.g. FM rotated
-// it out-of-band), making deletes idempotent.
+// ErrNotFound is returned when the FM API responds 404.
 var ErrNotFound = errors.New("fmclient: resource not found")
 
 // IsNotFound reports whether err represents a 404 from the FM API.
-func IsNotFound(err error) bool {
-	return errors.Is(err, ErrNotFound)
-}
+func IsNotFound(err error) bool { return errors.Is(err, ErrNotFound) }
 
 // ErrorEnvelope mirrors the FM API `ErrorEnvelope` schema.
 type ErrorEnvelope struct {
@@ -73,5 +69,5 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return s[:n] + "..."
 }

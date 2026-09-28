@@ -3,6 +3,7 @@ package featuremanagement
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +18,18 @@ import (
 func testBackend(t *testing.T) (*backend, *fmclienttest.Fake, logical.Storage) {
 	t.Helper()
 	fake := fmclienttest.New()
+	b, s := testBackendWith(t, fake)
+	return b, fake, s
+}
+
+// testBackendWith builds a backend over a caller-supplied fake, so several can share one FM service.
+func testBackendWith(t *testing.T, fake *fmclienttest.Fake) (*backend, logical.Storage) {
+	t.Helper()
+	// the pre-create pause is timing, not behaviour; TestProvision_* cover it explicitly
+	prev := createJitter
+	createJitter = 0
+	t.Cleanup(func() { createJitter = prev })
+
 	b := newBackend()
 	b.clientFactory = func(_ fmclient.Config) (fmclient.FMClient, error) { return fake, nil }
 	// Fail loudly if a test reaches the real AppRole resolver (which would dial
@@ -31,7 +44,7 @@ func testBackend(t *testing.T) (*backend, *fmclienttest.Fake, logical.Storage) {
 		StorageView: &logical.InmemStorage{},
 	}
 	require.NoError(t, b.Setup(context.Background(), cfg))
-	return b, fake, cfg.StorageView
+	return b, cfg.StorageView
 }
 
 func writeConfig(t *testing.T, b *backend, s logical.Storage) {
@@ -58,11 +71,6 @@ func writeDefaultRole(t *testing.T, b *backend, s logical.Storage) {
 		Operation: logical.CreateOperation,
 		Path:      "roles/default",
 		Storage:   s,
-		Data: map[string]interface{}{
-			"ttl":            "2280h",
-			"max_ttl":        "4560h",
-			"rotation_grace": "2h",
-		},
 	})
 	require.NoError(t, err)
 	if resp != nil {
@@ -136,7 +144,7 @@ func TestConfig_LoopbackWarning(t *testing.T) {
 	}
 }
 
-func TestCoordinate_MintFailureSurfacesConfigHint(t *testing.T) {
+func TestCoordinate_ProvisionFailureSurfacesConfigHint(t *testing.T) {
 	b, fake, s := testBackend(t)
 	writeConfig(t, b, s)
 	writeDefaultRole(t, b, s)
@@ -373,50 +381,42 @@ func TestGetClient_SourcedCredentialsResolveError(t *testing.T) {
 	require.Contains(t, err.Error(), "permission denied")
 }
 
-func TestRole_ResolveMostSpecific(t *testing.T) {
+func TestRole_Allowlist(t *testing.T) {
 	b, _, s := testBackend(t)
 	ctx := context.Background()
+	for name, data := range map[string]map[string]interface{}{
+		"byproject": {"project_key": "checkout"},
+		"bystage":   {"release_stage_key": "production"},
+		"bytype":    {"type": "web"},
+	} {
+		_, err := b.HandleRequest(ctx, &logical.Request{
+			Operation: logical.CreateOperation, Path: "roles/" + name, Storage: s, Data: data,
+		})
+		require.NoError(t, err)
+	}
 
-	// Catch-all and a project-specific role.
-	_, err := b.HandleRequest(ctx, &logical.Request{Operation: logical.CreateOperation, Path: "roles/default", Storage: s,
-		Data: map[string]interface{}{"ttl": "100h", "rotation_grace": "1h"}})
-	require.NoError(t, err)
-	_, err = b.HandleRequest(ctx, &logical.Request{Operation: logical.CreateOperation, Path: "roles/checkout", Storage: s,
-		Data: map[string]interface{}{"project_key": "checkout", "ttl": "200h", "rotation_grace": "1h"}})
-	require.NoError(t, err)
-
-	role, err := b.resolveRole(ctx, s, testCoord(t))
-	require.NoError(t, err)
-	require.Equal(t, "checkout", role.Name)
-	require.Equal(t, 200*time.Hour, role.TTL)
-
-	// A coordinate not matching the specific role falls back to the catch-all.
-	other, _ := parseCoordinate("dt01", "production", "billing", "server")
-	role, err = b.resolveRole(ctx, s, other)
-	require.NoError(t, err)
-	require.Equal(t, "default", role.Name)
-}
-
-func TestCoordinate_ReadMintsAndIsStable(t *testing.T) {
-	b, fake, s := testBackend(t)
-	writeConfig(t, b, s)
-	writeDefaultRole(t, b, s)
-
-	resp := readCoordinate(t, b, s, testCoordPath)
-	require.NotNil(t, resp.Secret)
-	key1 := resp.Data["sdk_key"].(string)
-	require.NotEmpty(t, key1)
-	require.Equal(t, 2280*time.Hour, resp.Secret.TTL)
-	require.Equal(t, 1, fake.ActiveCount("checkout", "production"))
-
-	// A second read returns the same current key (no new mint).
-	resp2 := readCoordinate(t, b, s, testCoordPath)
-	require.Equal(t, key1, resp2.Data["sdk_key"].(string))
-	require.Equal(t, 1, fake.ActiveCount("checkout", "production"))
-
-	// Internal data carries what revoke needs.
-	require.Equal(t, key1, resp.Secret.InternalData["full_sdk_key"])
-	require.Equal(t, testCoordPath, resp.Secret.InternalData["coordinate"])
+	for _, tc := range []struct {
+		name    string
+		stage   string
+		project string
+		typ     string
+		allowed bool
+	}{
+		{"two roles permit it, which must union rather than conflict", "production", "checkout", "server", true},
+		{"one role permits it", "development", "checkout", "server", true},
+		{"only the type role permits it", "development", "billing", "web", true},
+		{"no role permits it", "development", "billing", "server", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coord, err := parseCoordinate("dt01", tc.stage, tc.project, tc.typ)
+			require.NoError(t, err)
+			if tc.allowed {
+				require.NoError(t, b.coordinateAllowed(ctx, s, coord))
+			} else {
+				require.Error(t, b.coordinateAllowed(ctx, s, coord))
+			}
+		})
+	}
 }
 
 func TestCoordinate_NoMatchingRole(t *testing.T) {
@@ -429,130 +429,372 @@ func TestCoordinate_NoMatchingRole(t *testing.T) {
 	require.True(t, resp.IsError())
 }
 
-func TestRotate_MakeBeforeBreak(t *testing.T) {
+func TestReconcile_PropagatesOtherListErrors(t *testing.T) {
 	b, fake, s := testBackend(t)
 	ctx := context.Background()
 	writeConfig(t, b, s)
 	writeDefaultRole(t, b, s)
 
-	first := readCoordinate(t, b, s, testCoordPath)
-	keyA := first.Data["sdk_key"].(string)
+	readCoordinate(t, b, s, testCoordPath)
+	fake.ListErr = errors.New("FM unavailable")
 
-	resp, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.UpdateOperation, Path: "rotate/" + testCoordPath, Storage: s,
+	_, err := b.HandleRequest(ctx, &logical.Request{
+		Operation: logical.UpdateOperation, Path: "reconcile", Storage: s,
 	})
-	require.NoError(t, err)
-	require.False(t, resp.IsError())
-	keyB := resp.Data["sdk_key"].(string)
-	require.NotEqual(t, keyA, keyB)
+	require.Error(t, err, "a transient list failure must not be read as a stale record")
 
-	// Both keys still active (make-before-break); predecessor tombstoned for later.
-	require.Equal(t, 2, fake.ActiveCount("checkout", "production"))
-
-	ck, err := b.readCurrentKey(ctx, s, testCoord(t))
-	require.NoError(t, err)
-	require.Equal(t, keyB, ck.FullSDKKey)
-
-	tombs, err := b.listTombstones(ctx, s)
-	require.NoError(t, err)
-	require.Len(t, tombs, 1)
-	require.Equal(t, keyA, tombs[0].FullSDKKey)
-	require.True(t, tombs[0].DeleteAfter.After(time.Now()), "predecessor must survive the grace window")
+	ck, rerr := b.readCurrentKey(ctx, s, testCoord(t))
+	require.NoError(t, rerr)
+	require.NotNil(t, ck, "the record must survive a transient FM failure")
 }
 
-func TestPeriodicFunc_DeletesDueAndKeepsFuture(t *testing.T) {
+func TestReconciliationLoop_RunsOncePerInterval(t *testing.T) {
 	b, fake, s := testBackend(t)
 	ctx := context.Background()
 	writeConfig(t, b, s)
-	coord := testCoord(t)
+	writeDefaultRole(t, b, s)
+	readCoordinate(t, b, s, testCoordPath)
 
-	due, err := fake.CreateSdkKey(ctx, "checkout", "production", fmclient.SdkKeyTypeServer)
+	replacement, err := fake.CreateSdkKey(ctx, "checkout", "production", fmclient.SdkKeyTypeServer)
 	require.NoError(t, err)
-	future, err := fake.CreateSdkKey(ctx, "checkout", "production", fmclient.SdkKeyTypeServer)
-	require.NoError(t, err)
-	require.Equal(t, 2, fake.ActiveCount("checkout", "production"))
 
-	require.NoError(t, b.enqueueTombstone(ctx, s, coord, due.SdkKey, time.Now().Add(-time.Minute)))
-	require.NoError(t, b.enqueueTombstone(ctx, s, coord, future.SdkKey, time.Now().Add(time.Hour)))
-
+	// with a pass scheduled ahead, this tick must do nothing
+	b.nextReconcile = time.Now().Add(time.Hour)
 	require.NoError(t, b.periodicFunc(ctx, &logical.Request{Storage: s}))
+	require.NotEqual(t, replacement.SdkKey, readCoordinate(t, b, s, testCoordPath).Data["sdk_key"])
 
-	// Only the due key was deleted; the future one remains queued.
-	require.Equal(t, 1, fake.ActiveCount("checkout", "production"))
-	tombs, err := b.listTombstones(ctx, s)
-	require.NoError(t, err)
-	require.Len(t, tombs, 1)
-	require.Equal(t, future.SdkKey, tombs[0].FullSDKKey)
+	b.nextReconcile = time.Time{}
+	require.NoError(t, b.periodicFunc(ctx, &logical.Request{Storage: s}))
+	require.Equal(t, replacement.SdkKey, readCoordinate(t, b, s, testCoordPath).Data["sdk_key"],
+		"the loop is what moves a running instance onto a rotated key")
+	require.True(t, b.nextReconcile.After(time.Now()), "the loop must reschedule itself")
 }
 
-func TestRevoke_DeletesAndClearsCurrent(t *testing.T) {
+func TestReconciliationLoop_IdleMountNeedsNoConfig(t *testing.T) {
+	b, _, s := testBackend(t)
+	b.nextReconcile = time.Time{}
+	// no config and no records, so a pass must not try to build an FM client
+	require.NoError(t, b.periodicFunc(context.Background(), &logical.Request{Storage: s}))
+}
+
+func TestNextReconcileAt_IsJittered(t *testing.T) {
+	seen := map[time.Time]bool{}
+	for i := 0; i < 20; i++ {
+		at := nextReconcileAt(defaultReconcileInterval)
+		// the default 6h interval must land in 4h-8h
+		require.True(t, at.After(time.Now().Add(defaultReconcileInterval*2/3-time.Minute)))
+		require.True(t, at.Before(time.Now().Add(defaultReconcileInterval*4/3+time.Minute)))
+		seen[at] = true
+	}
+	require.Greater(t, len(seen), 1, "instances must not run in lockstep")
+}
+
+func TestReconcileInterval_ConfigurableWithDefaultAndFloor(t *testing.T) {
+	b, _, s := testBackend(t)
+	ctx := context.Background()
+	writeConfig(t, b, s)
+
+	read := func() int64 {
+		resp, err := b.HandleRequest(ctx, &logical.Request{
+			Operation: logical.ReadOperation, Path: "config", Storage: s,
+		})
+		require.NoError(t, err)
+		return resp.Data["reconcile_interval"].(int64)
+	}
+	require.EqualValues(t, defaultReconcileInterval.Seconds(), read(), "unset means the default")
+
+	set := func(v interface{}) *logical.Response {
+		resp, err := b.HandleRequest(ctx, &logical.Request{
+			Operation: logical.UpdateOperation, Path: "config", Storage: s,
+			Data: map[string]interface{}{"reconcile_interval": v},
+		})
+		require.NoError(t, err)
+		return resp
+	}
+
+	require.False(t, set("30m").IsError())
+	require.EqualValues(t, 1800, read())
+
+	require.True(t, set("10s").IsError(), "a floor stops hundreds of instances polling FM")
+	require.EqualValues(t, 1800, read(), "a rejected write must not change the stored value")
+
+	require.False(t, set(0).IsError(), "0 turns the loop off")
+	require.EqualValues(t, 0, read(), "read echoes the write convention")
+
+	require.True(t, b.nextReconcile.IsZero(),
+		"a config write must re-arm the loop so a changed interval takes effect promptly")
+}
+
+func TestReconciliationLoop_DisabledByConfig(t *testing.T) {
 	b, fake, s := testBackend(t)
 	ctx := context.Background()
 	writeConfig(t, b, s)
 	writeDefaultRole(t, b, s)
-
-	read := readCoordinate(t, b, s, testCoordPath)
-	require.Equal(t, 1, fake.ActiveCount("checkout", "production"))
+	readCoordinate(t, b, s, testCoordPath)
 
 	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.RevokeOperation, Storage: s, Secret: read.Secret,
+		Operation: logical.UpdateOperation, Path: "config", Storage: s,
+		Data: map[string]interface{}{"reconcile_interval": 0},
 	})
 	require.NoError(t, err)
-	require.Equal(t, 0, fake.ActiveCount("checkout", "production"))
 
-	ck, err := b.readCurrentKey(ctx, s, testCoord(t))
+	replacement, err := fake.CreateSdkKey(ctx, "checkout", "production", fmclient.SdkKeyTypeServer)
 	require.NoError(t, err)
-	require.Nil(t, ck, "current key should be cleared after revoke")
+
+	b.nextReconcile = time.Time{}
+	require.NoError(t, b.periodicFunc(ctx, &logical.Request{Storage: s}))
+	require.NotEqual(t, replacement.SdkKey, readCoordinate(t, b, s, testCoordPath).Data["sdk_key"],
+		"a disabled loop must not re-point")
+
+	// the path still works when the loop is off
+	_, err = b.HandleRequest(ctx, &logical.Request{
+		Operation: logical.UpdateOperation, Path: "reconcile", Storage: s,
+	})
+	require.NoError(t, err)
+	require.Equal(t, replacement.SdkKey, readCoordinate(t, b, s, testCoordPath).Data["sdk_key"])
 }
 
-func TestRevoke_FailureEnqueuesTombstoneAndErrors(t *testing.T) {
+// An instance that loses a cold-start race must adopt rather than create its own key.
+func TestProvision_RecheckAdoptsAKeyThatAppearsDuringTheJitter(t *testing.T) {
 	b, fake, s := testBackend(t)
 	ctx := context.Background()
 	writeConfig(t, b, s)
 	writeDefaultRole(t, b, s)
 
-	read := readCoordinate(t, b, s, testCoordPath)
-	fake.DeleteErr = errors.New("FM unavailable")
+	createJitter = 20 * time.Millisecond
+	t.Cleanup(func() { createJitter = 0 })
 
-	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.RevokeOperation, Storage: s, Secret: read.Secret,
-	})
-	require.Error(t, err, "revoke must surface the delete failure so Vault retries")
+	// another instance wins the race between our first list and our re-check
+	var racer string
+	lists := 0
+	fake.BeforeList = func() {
+		lists++
+		if lists == 1 {
+			d, err := fake.CreateSdkKey(ctx, "checkout", "production", fmclient.SdkKeyTypeServer)
+			require.NoError(t, err)
+			racer = d.SdkKey
+		}
+	}
 
-	tombs, terr := b.listTombstones(ctx, s)
-	require.NoError(t, terr)
-	require.Len(t, tombs, 1, "a failed revoke must enqueue a tombstone (orphan retry)")
-	require.Equal(t, read.Data["sdk_key"], tombs[0].FullSDKKey)
-}
-
-func TestWALRollback_ReapsOrphanKeepsTracked(t *testing.T) {
-	b, fake, s := testBackend(t)
-	ctx := context.Background()
-	writeConfig(t, b, s)
-	writeDefaultRole(t, b, s)
-
-	// Tracked key via a normal read.
-	read := readCoordinate(t, b, s, testCoordPath)
-	tracked := read.Data["sdk_key"].(string)
-
-	// Simulate an orphan from a crashed create: a key in FM the plugin doesn't track.
-	orphan, err := fake.CreateSdkKey(ctx, "checkout", "production", fmclient.SdkKeyTypeServer)
-	require.NoError(t, err)
-	require.Equal(t, 2, fake.ActiveCount("checkout", "production"))
-
-	err = b.walRollback(ctx, &logical.Request{Storage: s}, walKindCreate, map[string]interface{}{
-		"coordinate":    testCoordPath,
-		"project":       "checkout",
-		"release_stage": "production",
-		"type":          "server",
-	})
-	require.NoError(t, err)
-
-	// Orphan reaped, tracked key preserved.
+	resp := readCoordinate(t, b, s, testCoordPath)
+	require.Equal(t, racer, resp.Data["sdk_key"], "must adopt the racer's key")
+	require.Len(t, fake.Created, 1, "the loser must not create a second key")
 	require.Equal(t, 1, fake.ActiveCount("checkout", "production"))
-	list, err := fake.ListSdkKeys(ctx, "checkout", "production")
-	require.NoError(t, err)
-	require.Len(t, list.Server, 1)
-	require.Equal(t, tracked, list.Server[0].SdkKey)
-	require.NotEqual(t, orphan.SdkKey, list.Server[0].SdkKey)
+}
+
+func TestCoordinate_ReadAdoptsOrProvisions(t *testing.T) {
+	web, server := fmclient.SdkKeyTypeWeb, fmclient.SdkKeyTypeServer
+	for _, tc := range []struct {
+		name       string
+		seed       []fmclient.SdkKeyType
+		wantCreate bool
+	}{
+		{"FM is empty, so one is created", nil, true},
+		{"FM holds a key, so it is adopted", []fmclient.SdkKeyType{server}, false},
+		{"FM holds several, so the newest is adopted", []fmclient.SdkKeyType{server, server, server}, false},
+		{"FM holds only another type, so one is created", []fmclient.SdkKeyType{web}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, fake, s := testBackend(t)
+			ctx := context.Background()
+			writeConfig(t, b, s)
+			writeDefaultRole(t, b, s)
+
+			var newestServer string
+			for _, typ := range tc.seed {
+				d, err := fake.CreateSdkKey(ctx, "checkout", "production", typ)
+				require.NoError(t, err)
+				if typ == server {
+					newestServer = d.SdkKey
+				}
+			}
+			seeded := len(fake.Created)
+
+			resp := readCoordinate(t, b, s, testCoordPath)
+			got := resp.Data["sdk_key"].(string)
+			require.Nil(t, resp.Secret, "the key is static, so no lease is issued")
+
+			if tc.wantCreate {
+				require.Len(t, fake.Created, seeded+1)
+				require.NotEqual(t, newestServer, got)
+			} else {
+				require.Len(t, fake.Created, seeded, "adoption must create nothing")
+				require.Equal(t, newestServer, got)
+			}
+
+			afterFirst := len(fake.Created)
+			require.Equal(t, got, readCoordinate(t, b, s, testCoordPath).Data["sdk_key"],
+				"a second read is served from the record")
+			require.Len(t, fake.Created, afterFirst, "and never touches FM")
+		})
+	}
+}
+
+// Separate Vault instances share no storage, so FM is the only thing stopping each from minting
+// its own key. This also covers a rebuilt instance that lost its storage.
+func TestCoordinate_SeparateInstancesShareOneKey(t *testing.T) {
+	fake := fmclienttest.New()
+	first, firstStore := testBackendWith(t, fake)
+	writeConfig(t, first, firstStore)
+	writeDefaultRole(t, first, firstStore)
+	key := readCoordinate(t, first, firstStore, testCoordPath).Data["sdk_key"]
+
+	second, secondStore := testBackendWith(t, fake)
+	writeConfig(t, second, secondStore)
+	writeDefaultRole(t, second, secondStore)
+
+	require.Equal(t, key, readCoordinate(t, second, secondStore, testCoordPath).Data["sdk_key"])
+	require.Len(t, fake.Created, 1, "one key per coordinate no matter how many instances")
+}
+
+func TestReconcile_Outcomes(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		arrange     func(t *testing.T, ctx context.Context, fake *fmclienttest.Fake, current string) string
+		wantCleared int
+		wantUpdated int
+		wantActive  int
+	}{
+		{
+			name:       "the record is already the newest key, so nothing changes",
+			arrange:    func(_ *testing.T, _ context.Context, _ *fmclienttest.Fake, current string) string { return current },
+			wantActive: 1,
+		},
+		{
+			name: "a newer key exists, so the record moves onto it and the old key survives",
+			arrange: func(t *testing.T, ctx context.Context, fake *fmclienttest.Fake, _ string) string {
+				d, err := fake.CreateSdkKey(ctx, "checkout", "production", fmclient.SdkKeyTypeServer)
+				require.NoError(t, err)
+				return d.SdkKey
+			},
+			wantUpdated: 1,
+			wantActive:  2,
+		},
+		{
+			name: "FM no longer has the key, so the record is cleared",
+			arrange: func(_ *testing.T, _ context.Context, fake *fmclienttest.Fake, current string) string {
+				fake.Drop("checkout", "production", current)
+				return ""
+			},
+			wantCleared: 1,
+		},
+		{
+			name: "FM 404s the project, so the record is cleared",
+			arrange: func(_ *testing.T, _ context.Context, fake *fmclienttest.Fake, _ string) string {
+				fake.ListErr = fmclient.ErrNotFound
+				return ""
+			},
+			wantCleared: 1,
+			wantActive:  1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, fake, s := testBackend(t)
+			ctx := context.Background()
+			writeConfig(t, b, s)
+			writeDefaultRole(t, b, s)
+			current := readCoordinate(t, b, s, testCoordPath).Data["sdk_key"].(string)
+
+			want := tc.arrange(t, ctx, fake, current)
+
+			resp, err := b.HandleRequest(ctx, &logical.Request{
+				Operation: logical.UpdateOperation, Path: "reconcile", Storage: s,
+			})
+			require.NoError(t, err)
+			require.False(t, resp.IsError())
+			require.Len(t, resp.Data["cleared_stale_current"], tc.wantCleared)
+			require.Len(t, resp.Data["updated_to_newest"], tc.wantUpdated)
+			require.Equal(t, tc.wantActive, fake.ActiveCount("checkout", "production"),
+				"reconcile never deletes in FM")
+
+			ck, err := b.readCurrentKey(ctx, s, testCoord(t))
+			require.NoError(t, err)
+			if want == "" {
+				require.Nil(t, ck, "a stale record must be cleared so the next read provisions")
+			} else {
+				require.NotNil(t, ck)
+				require.Equal(t, want, ck.FullSDKKey)
+			}
+		})
+	}
+}
+
+// The convergence rule must be total and must not depend on optional response fields, or separate
+// instances could pick different winners from the same list.
+func TestPickKey_IsDeterministic(t *testing.T) {
+	at := func(sec int) *fmclient.ModificationInfo {
+		return &fmclient.ModificationInfo{CreatedTime: time.Unix(int64(sec), 0).UTC()}
+	}
+	key := func(prefix string) string { return "dt01.server_us_" + prefix + ".abc_def" }
+
+	list := &fmclient.SDKKeyList{Server: []fmclient.SDKKeyDetails{
+		{SdkKey: key("bbbbbbbbbb"), ModificationInfo: at(100)},
+		{SdkKey: key("cccccccccc"), ModificationInfo: at(300)},
+		{SdkKey: key("aaaaaaaaaa"), ModificationInfo: at(200)},
+	}}
+	got := pickKey(list, fmclient.SdkKeyTypeServer)
+	require.NotNil(t, got)
+	require.Equal(t, key("cccccccccc"), got.SdkKey, "newest wins regardless of list order")
+
+	// equal timestamps fall back to the public prefix rather than list order
+	tied := &fmclient.SDKKeyList{Server: []fmclient.SDKKeyDetails{
+		{SdkKey: key("zzzzzzzzzz"), ModificationInfo: at(100)},
+		{SdkKey: key("aaaaaaaaaa"), ModificationInfo: at(100)},
+	}}
+	require.Equal(t, key("aaaaaaaaaa"), pickKey(tied, fmclient.SdkKeyTypeServer).SdkKey)
+
+	// FM may omit modificationInfo; the ordering must still be total
+	missing := &fmclient.SDKKeyList{Server: []fmclient.SDKKeyDetails{
+		{SdkKey: key("aaaaaaaaaa")},
+		{SdkKey: key("bbbbbbbbbb"), ModificationInfo: at(100)},
+	}}
+	require.Equal(t, key("bbbbbbbbbb"), pickKey(missing, fmclient.SdkKeyTypeServer).SdkKey,
+		"a key with a known time beats one with none")
+
+	require.Nil(t, pickKey(&fmclient.SDKKeyList{}, fmclient.SdkKeyTypeServer))
+	require.Nil(t, pickKey(nil, fmclient.SdkKeyTypeServer))
+}
+
+// failingStorage makes Put fail under a prefix, to simulate storage dying mid-provision.
+type failingStorage struct {
+	logical.Storage
+	failPrefix string
+	fail       bool
+}
+
+func (f *failingStorage) Put(ctx context.Context, e *logical.StorageEntry) error {
+	if f.fail && strings.HasPrefix(e.Key, f.failPrefix) {
+		return errors.New("storage unavailable")
+	}
+	return f.Storage.Put(ctx, e)
+}
+
+// Failing to record a freshly created key is recoverable, not an orphan
+func TestProvision_StorageFailureNeitherOrphansNorDuplicates(t *testing.T) {
+	fake := fmclienttest.New()
+	b, base := testBackendWith(t, fake)
+	ctx := context.Background()
+	writeConfig(t, b, base)
+	writeDefaultRole(t, b, base)
+
+	s := &failingStorage{Storage: base, failPrefix: storageCurrentPrefix, fail: true}
+	read := func() (*logical.Response, error) {
+		return b.HandleRequest(ctx, &logical.Request{
+			Operation: logical.ReadOperation, Path: testCoordPath, Storage: s,
+		})
+	}
+
+	_, err := read()
+	require.Error(t, err, "the read fails because the record cannot be stored")
+	require.Len(t, fake.Created, 1, "but the key was created in FM")
+
+	_, err = read()
+	require.Error(t, err)
+	require.Len(t, fake.Created, 1, "a retry adopts that key rather than creating a second")
+
+	s.fail = false
+	resp := readCoordinate(t, b, s, testCoordPath)
+	require.Len(t, fake.Created, 1, "recovery still adopts the original key")
+	require.Equal(t, fake.Created[0], resp.Data["public_prefix"])
+	require.Equal(t, 1, fake.ActiveCount("checkout", "production"))
 }

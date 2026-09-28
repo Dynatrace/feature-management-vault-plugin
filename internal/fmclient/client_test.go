@@ -49,16 +49,6 @@ func newTestServerAndClient(t *testing.T) (*httptest.Server, *fmclient.Client, *
 		l, _ := store.ListSdkKeys(r.Context(), r.PathValue("p"), r.PathValue("s"))
 		_ = json.NewEncoder(w).Encode(l)
 	})
-	mux.HandleFunc("DELETE "+testAPIBase+"/projects/{p}/release-stages/{s}/sdk-keys/{k}", func(w http.ResponseWriter, r *http.Request) {
-		seen.record(r)
-		err := store.DeleteSdkKey(r.Context(), r.PathValue("p"), r.PathValue("s"), r.PathValue("k"))
-		if fmclient.IsNotFound(err) {
-			writeEnvelope(w, http.StatusNotFound, "not found")
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	})
-
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
@@ -91,7 +81,7 @@ func writeEnvelope(w http.ResponseWriter, status int, msg string) {
 	_ = json.NewEncoder(w).Encode(fmclient.ErrorEnvelope{Code: status, Message: msg})
 }
 
-func TestClient_CreateListDelete(t *testing.T) {
+func TestClient_CreateAndList(t *testing.T) {
 	ctx := context.Background()
 	_, c, seen := newTestServerAndClient(t)
 
@@ -109,18 +99,7 @@ func TestClient_CreateListDelete(t *testing.T) {
 	list, err := c.ListSdkKeys(ctx, "checkout", "production")
 	require.NoError(t, err)
 	require.Len(t, list.Server, 1)
-
-	require.NoError(t, c.DeleteSdkKey(ctx, "checkout", "production", details.SdkKey))
-
-	list, err = c.ListSdkKeys(ctx, "checkout", "production")
-	require.NoError(t, err)
-	require.Empty(t, list.Server)
-}
-
-func TestClient_DeleteNotFound(t *testing.T) {
-	_, c, _ := newTestServerAndClient(t)
-	err := c.DeleteSdkKey(context.Background(), "checkout", "production", "dt01.server_us_abcdefghij.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_bbbbbbbbbb")
-	require.True(t, fmclient.IsNotFound(err), "expected ErrNotFound, got %v", err)
+	require.Equal(t, details.SdkKey, list.Server[0].SdkKey)
 }
 
 func TestClient_APIError(t *testing.T) {

@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# demo.sh — end-to-end demonstration of the Feature Management Vault plugin.
+# demo.sh: end-to-end demonstration of the Feature Management Vault plugin.
 #
 # Two modes:
 #
-#   MOCK (default) — fully self-contained: builds a mock FM service + a throwaway
+#   MOCK (default): fully self-contained: builds a mock FM service + a throwaway
 #   dev Vault and exercises the full SDK-key lifecycle with no real credentials.
 #
 #       ./scripts/demo.sh
 #
-#   LIVE — points the plugin at a REAL Feature Management service. Triggered by
+#   LIVE: points the plugin at a REAL Feature Management service. Triggered by
 #   setting FM_BASE_URL (all FM_* vars below are then required). It still runs a
 #   throwaway dev Vault locally; only the FM service is real.
 #
@@ -19,23 +19,23 @@
 #       FM_PROJECT=<existing-project> FM_STAGE=<existing-release-stage> \
 #       ./scripts/demo.sh
 #
-#     LIVE mode CREATES, ROTATES and DELETES real SDK keys for the given
-#     project/release-stage (which must already exist). Keys the demo creates are
-#     cleaned up on exit; pre-existing keys are never touched. The real
-#     client_secret is never printed.
+#     LIVE mode CREATES real SDK keys for the given project/release-stage (which
+#     must already exist). The plugin itself never deletes; the demo deletes only
+#     the keys it created, on exit. The real client_secret is never printed.
 #
 # Options (env vars):
 #   FM_PROJECT / FM_STAGE / FM_TYPE / FM_VERSION   coordinate (defaults below)
 #   VAULT_PORT=8210 / MOCK_PORT=8899               preferred ports (auto-bump)
 #   KEEP_RUNNING=1     leave the servers running afterward (skips FM cleanup)
 #   LIVE_YES=1         skip the live-mode confirmation prompt
-#   DEMO_WAIT_SWEEP=1  also demonstrate the deferred-delete sweep (waits ~75s)
 set -euo pipefail
 
-PLUGIN_NAME="vault-plugin-secrets-feature-management"
+PLUGIN_NAME="vault-plugin-dynatrace-feature-management"
 PLUGIN_VERSION="v0.0.1"
 MOUNT="feature-management"
-SCOPES="feature-management:sdk-keys:read feature-management:sdk-keys:write feature-management:sdk-keys:delete"
+SCOPES="feature-management:sdk-keys:read feature-management:sdk-keys:write"
+# the demo's own cleanup deletes what it created; the plugin has no delete scope
+CLEANUP_SCOPES="${SCOPES} feature-management:sdk-keys:delete"
 
 # Coordinate (override for LIVE mode to match a real project / release stage).
 VERSION="${FM_VERSION:-dt01}"
@@ -82,7 +82,7 @@ wait_http() { # ready once the endpoint accepts a connection (any HTTP code)
 
 public_prefix() { printf '%s' "$1" | cut -d. -f1-2; }
 
-# json_get <key> — extract a top-level string field from JSON on stdin.
+# json_get <key>: extract a top-level string field from JSON on stdin.
 json_get() {
   if command -v python3 >/dev/null 2>&1; then
     python3 -c "import sys,json;print(json.load(sys.stdin).get('$1',''))" 2>/dev/null
@@ -91,7 +91,7 @@ json_get() {
   fi
 }
 
-# extract_sdkkeys — print every sdkKey value from an SDKKeyList JSON on stdin.
+# extract_sdkkeys: print every sdkKey value from an SDKKeyList JSON on stdin.
 extract_sdkkeys() {
   if command -v python3 >/dev/null 2>&1; then
     python3 -c '
@@ -114,7 +114,7 @@ fm_token() { # echo a client-credentials bearer token (empty on failure)
   curl -s --max-time 15 -X POST "$CFG_TOKEN_URL" \
     -d grant_type=client_credentials \
     -d "client_id=${CFG_CLIENT_ID}" -d "client_secret=${CFG_CLIENT_SECRET}" \
-    --data-urlencode "scope=${SCOPES}" 2>/dev/null | json_get access_token
+    --data-urlencode "scope=${1:-$SCOPES}" 2>/dev/null | json_get access_token
 }
 
 fm_list_keys() { # echo every active sdkKey for the coordinate's bucket (one per line)
@@ -139,7 +139,16 @@ fm_count() { # echo the number of active keys in the bucket, or n/a on error
   rm -f "$body"
 }
 
-# live_cleanup — delete ONLY the keys this demo created (current bucket minus the
+fm_create() { # create a key directly in FM, echoing its public prefix
+  local tok
+  tok="$(fm_token)"; [[ -z "$tok" ]] && { echo "n/a (no token)"; return; }
+  curl -s --max-time 15 -X POST \
+    -H "Authorization: Bearer ${tok}" -H "Dt-Tenant: ${CFG_TENANT}" \
+    -H 'Content-Type: application/json' -d "{\"type\":\"${TYPE}\"}" \
+    "${CFG_FM_BASE_URL}/projects/${PROJECT}/release-stages/${STAGE}/sdk-keys" | json_get sdkKey | cut -d. -f1-2
+}
+
+# live_cleanup: delete ONLY the keys this demo created (current bucket minus the
 # baseline snapshot). Pre-existing keys are never touched.
 live_cleanup() {
   [[ "$MODE" == "live" ]] || return 0
@@ -147,7 +156,7 @@ live_cleanup() {
   local tok created
   created="$(comm -13 <(sort -u "$BASELINE") <(fm_list_keys | sort -u) 2>/dev/null || true)"
   if [[ -z "$created" ]]; then echo "live cleanup: no demo-created keys remain in FM"; return 0; fi
-  tok="$(fm_token)"
+  tok="$(fm_token "$CLEANUP_SCOPES")"
   echo "live cleanup: deleting demo-created keys (pre-existing keys left untouched) ..."
   while IFS= read -r k; do
     [[ -z "$k" ]] && continue
@@ -161,7 +170,7 @@ live_cleanup() {
 # --- cleanup -----------------------------------------------------------------
 cleanup() {
   if [[ "${KEEP_RUNNING:-0}" == "1" ]]; then
-    bold "KEEP_RUNNING=1 — leaving servers up (FM cleanup skipped):"
+    bold "KEEP_RUNNING=1: leaving servers up (FM cleanup skipped):"
     echo "  VAULT_ADDR=${VAULT_ADDR}  VAULT_TOKEN=root   (vault pid ${VAULT_PID})"
     [[ "$MODE" == "mock" ]] && echo "  mock FM:    http://127.0.0.1:${MOCK_PORT}     (mock pid ${MOCK_PID})"
     echo "  workdir:    ${WORKDIR}"
@@ -212,11 +221,11 @@ fi
 
 # --- live-mode confirmation --------------------------------------------------
 if [[ "$MODE" == "live" && "${LIVE_YES:-0}" != "1" ]]; then
-  bold "LIVE MODE — this will CREATE, ROTATE and DELETE real SDK keys:"
+  bold "LIVE MODE - this will CREATE real SDK keys:"
   echo "  FM service: ${CFG_FM_BASE_URL}"
   echo "  tenant:     ${CFG_TENANT}"
   echo "  coordinate: ${COORD}   (project & release-stage must already exist)"
-  echo "  Demo-created keys are cleaned up on exit; pre-existing keys are left untouched."
+  echo "  The plugin never deletes. The demo removes only what it created, on exit."
   printf "Continue? [y/N] "
   read -r ans || ans=""
   case "$ans" in y|Y|yes|YES) ;; *) echo "aborted."; exit 1 ;; esac
@@ -251,7 +260,6 @@ step "Register + enable the plugin"
 SHA="$(sha256 "${PLUGIN_DIR}/${PLUGIN_NAME}")"
 run "vault plugin register -sha256='${SHA}' -version='${PLUGIN_VERSION}' secret '${PLUGIN_NAME}'"
 run "vault secrets enable -path='${MOUNT}' -plugin-version='${PLUGIN_VERSION}' '${PLUGIN_NAME}'"
-run "vault secrets tune -max-lease-ttl=4560h '${MOUNT}'"
 
 step "Configure the mount (client_secret is never printed)"
 echo "  fm_base_url = ${CFG_FM_BASE_URL}"
@@ -267,8 +275,8 @@ echo "configured."
 echo "--- read back (client_secret must NOT appear) ---"
 run "vault read ${MOUNT}/config"
 
-step "Create a catch-all policy role 'default'"
-run "vault write ${MOUNT}/roles/default ttl=2280h max_ttl=4560h rotation_grace=2h"
+step "Create a catch-all role 'default' (allowlists every coordinate)"
+run "vault write -f ${MOUNT}/roles/default"
 
 # Snapshot the pre-existing FM keys so live cleanup only removes what we create.
 fm_list_keys >"${BASELINE}" 2>/dev/null || true
@@ -276,49 +284,31 @@ BASE_COUNT=0
 [[ -s "${BASELINE}" ]] && BASE_COUNT="$(grep -c . "${BASELINE}")"
 [[ "$MODE" == "live" ]] && echo "baseline: ${BASE_COUNT} pre-existing key(s) in this bucket (will be preserved)"
 
-step "Read a coordinate → mints a key in FM and issues a Vault lease"
+step "Read a coordinate: provisions a key in FM and returns it"
 bold "GET ${MOUNT}/${COORD}"
 run "vault read ${MOUNT}/${COORD}"
 echo "FM active keys: $(fm_count)  (baseline + 1)"
 
-step "Read again → returns the SAME current key (no new mint)"
+step "Read again: returns the SAME key, with no second create"
 run "vault read -field=public_prefix ${MOUNT}/${COORD}; echo"
-echo "FM active keys: $(fm_count)  (unchanged — stable)"
+echo "FM active keys: $(fm_count)  (unchanged, stable)"
 
-step "Rotate → mints a NEW key now; predecessor kept until the grace window (make-before-break)"
-run "vault write -f ${MOUNT}/rotate/${COORD}"
-echo "FM active keys: $(fm_count)  (baseline + 2 — old + new overlap during grace)"
+step "The response carries no lease, so nothing expires or revokes the key"
+run "vault list sys/leases/lookup/${MOUNT}/ || true"
 
-step "Re-read after rotation → consumer picks up the new key under a fresh lease"
+step "Rotation: an operator creates a replacement directly in FM"
+NEW_PREFIX="$(fm_create)"
+echo "created ${NEW_PREFIX} out of band; FM active keys: $(fm_count)  (both live)"
 run "vault read -field=public_prefix ${MOUNT}/${COORD}; echo"
+echo "still the old key: a stored record is served without consulting FM"
 
-if [[ "$MODE" == "mock" ]]; then
-  step "Reconcile → new key is current, predecessor is queued; no orphans"
-  run "vault write -f ${MOUNT}/reconcile"
-else
-  step "Reconcile (skipped in LIVE mode)"
-  echo "Skipped: reconcile treats any untracked FM key as an orphan, which would"
-  echo "flag your pre-existing keys. It is safe to run manually (read-only without"
-  echo "delete_orphans=true): vault write ${MOUNT}/reconcile"
-fi
-
-step "Revoke the leases → deletes the corresponding keys in FM"
-run "vault lease revoke -prefix -sync ${MOUNT}/"
-echo "FM active keys: $(fm_count)  (both leased keys deleted; back toward baseline of ${BASE_COUNT})"
-
-if [[ "${DEMO_WAIT_SWEEP:-0}" == "1" ]]; then
-  step "Demonstrate the deferred-delete sweep (short grace, waits for the periodic func)"
-  run "vault write ${MOUNT}/roles/default ttl=2280h max_ttl=4560h rotation_grace=5s"
-  run "vault read -field=public_prefix ${MOUNT}/${COORD}; echo"   # ensure a current key exists
-  run "vault write -f ${MOUNT}/rotate/${COORD}"
-  echo "FM active keys right after rotate: $(fm_count)"
-  echo "waiting ~75s for the grace window + periodic sweep ..."
-  sleep 75
-  echo "FM active keys after sweep: $(fm_count)  (predecessor should be deleted)"
-  run "vault lease revoke -prefix -sync ${MOUNT}/"
-fi
+step "Reconcile re-points the mount at the newest key, deleting nothing"
+run "vault write -f ${MOUNT}/reconcile"
+run "vault read -field=public_prefix ${MOUNT}/${COORD}; echo"
+echo "FM active keys: $(fm_count)  (both still live; the operator deletes the old one when ready)"
+echo "the reconciliation loop does this on its own every few hours, so no fleet-wide command is needed"
 
 step "Done"
-bold "The plugin minted, served, rotated, and revoked SDK keys end-to-end (${MODE} mode)."
-[[ "$MODE" == "live" ]] && echo "Demo-created keys will be cleaned up on exit; your pre-existing keys are untouched."
+bold "The plugin provisioned, served and rotated an SDK key end-to-end (${MODE} mode), deleting nothing."
+[[ "$MODE" == "live" ]] && echo "The demo removes the keys it created on exit; your pre-existing keys are untouched."
 echo "Logs: ${VAULT_LOG}$( [[ "$MODE" == "mock" ]] && echo " , ${MOCK_LOG}")"

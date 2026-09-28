@@ -1,4 +1,4 @@
-PLUGIN_NAME := vault-plugin-secrets-feature-management
+PLUGIN_NAME := vault-plugin-dynatrace-feature-management
 BIN_DIR     := bin
 PLUGIN_DIR  ?= $(CURDIR)/vault/plugins
 VERSION     ?= v0.0.1

@@ -1,4 +1,4 @@
-// Command vault-plugin-secrets-feature-management is the entrypoint binary for
+// Command vault-plugin-dynatrace-feature-management is the entrypoint binary for
 // the Feature Management Vault secrets-engine plugin.
 package main
 
@@ -87,7 +87,7 @@ func setupMetrics(ctx context.Context, logger hclog.Logger) (func(context.Contex
 	res, err := resource.Merge(
 		resource.Default(),
 		resource.NewSchemaless(
-			semconv.ServiceName("vault-plugin-secrets-feature-management"),
+			semconv.ServiceName("vault-plugin-dynatrace-feature-management"),
 			semconv.ServiceVersion(version),
 		),
 	)

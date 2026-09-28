@@ -3,7 +3,6 @@ package featuremanagement
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -11,93 +10,48 @@ import (
 	"github.com/dynatrace/feature-management-vault-plugin/internal/fmclient"
 )
 
-// Role policy defaults (see SDK Key Lifecycle in the scoping doc).
-const (
-	defaultRoleTTL       = 2280 * time.Hour // ~3 months
-	defaultRoleMaxTTL    = 4560 * time.Hour // ~6 months
-	defaultRotationGrace = 2 * time.Hour
-)
-
-// roleEntry is a policy template. Its constraints are optional; an empty field
-// is a wildcard. The coordinate read path resolves the most-specific matching
-// role to obtain TTLs and the rotation grace window.
+// roleEntry allowlists the coordinates a mount may serve; an empty field is a wildcard.
 type roleEntry struct {
-	Name            string        `json:"name"`
-	ProjectKey      string        `json:"project_key,omitempty"`
-	ReleaseStageKey string        `json:"release_stage_key,omitempty"`
-	Type            string        `json:"type,omitempty"` // web|server|mobile; empty = any
-	TTL             time.Duration `json:"ttl"`
-	MaxTTL          time.Duration `json:"max_ttl"`
-	RotationGrace   time.Duration `json:"rotation_grace"`
+	Name            string `json:"name"`
+	ProjectKey      string `json:"project_key,omitempty"`
+	ReleaseStageKey string `json:"release_stage_key,omitempty"`
+	Type            string `json:"type,omitempty"` // web|server|mobile; empty = any
 }
 
-// matches reports whether the role applies to coord, and how many constraints
-// it pins (its specificity). A role with no constraints matches everything at
-// specificity 0 (a catch-all).
-func (r *roleEntry) matches(coord coordinate) (bool, int) {
-	spec := 0
-	if r.ProjectKey != "" {
-		if r.ProjectKey != coord.Project {
-			return false, 0
-		}
-		spec++
+// matches reports whether the role permits coord; an empty constraint is a wildcard.
+func (r *roleEntry) matches(coord coordinate) bool {
+	if r.ProjectKey != "" && r.ProjectKey != coord.Project {
+		return false
 	}
-	if r.ReleaseStageKey != "" {
-		if r.ReleaseStageKey != coord.ReleaseStage {
-			return false, 0
-		}
-		spec++
+	if r.ReleaseStageKey != "" && r.ReleaseStageKey != coord.ReleaseStage {
+		return false
 	}
-	if r.Type != "" {
-		if r.Type != string(coord.Type) {
-			return false, 0
-		}
-		spec++
+	if r.Type != "" && r.Type != string(coord.Type) {
+		return false
 	}
-	return true, spec
+	return true
 }
 
 func (b *backend) readRole(ctx context.Context, s logical.Storage, name string) (*roleEntry, error) {
 	return getJSON[roleEntry](ctx, s, storageRolePrefix+name)
 }
 
-// resolveRole returns the most-specific role matching coord. If several roles
-// tie at the top specificity the match is ambiguous and an error is returned;
-// if none match, the caller must create a matching or catch-all role.
-func (b *backend) resolveRole(ctx context.Context, s logical.Storage, coord coordinate) (*roleEntry, error) {
+// coordinateAllowed returns nil when any role permits coord; overlapping roles simply union.
+func (b *backend) coordinateAllowed(ctx context.Context, s logical.Storage, coord coordinate) error {
 	names, err := s.List(ctx, storageRolePrefix)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var best *roleEntry
-	bestSpec := -1
-	tie := false
 	for _, name := range names {
 		role, err := b.readRole(ctx, s, name)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		if role == nil {
-			continue
-		}
-		ok, spec := role.matches(coord)
-		if !ok {
-			continue
-		}
-		switch {
-		case spec > bestSpec:
-			best, bestSpec, tie = role, spec, false
-		case spec == bestSpec:
-			tie = true
+		if role != nil && role.matches(coord) {
+			return nil
 		}
 	}
-	if best == nil {
-		return nil, fmt.Errorf("no role matches coordinate %q; create a matching role or an unconstrained catch-all role", coord)
-	}
-	if tie {
-		return nil, fmt.Errorf("ambiguous role match for coordinate %q: multiple roles match with equal specificity", coord)
-	}
-	return best, nil
+	return fmt.Errorf("no role matches coordinate %q; create a matching role or an unconstrained catch-all role", coord)
 }
 
 func (b *backend) pathRoles() *framework.Path {
@@ -125,18 +79,6 @@ func (b *backend) pathRoles() *framework.Path {
 				Type:        framework.TypeLowerCaseString,
 				Description: "Optional SDK key type constraint (web, server, or mobile). Empty matches any type.",
 			},
-			"ttl": {
-				Type:        framework.TypeDurationSecond,
-				Description: "Default lease TTL before rotation. Defaults to 2280h (~3 months).",
-			},
-			"max_ttl": {
-				Type:        framework.TypeDurationSecond,
-				Description: "Maximum lease TTL. Defaults to 4560h.",
-			},
-			"rotation_grace": {
-				Type:        framework.TypeDurationSecond,
-				Description: "Overlap window during which the predecessor key remains valid after rotation. Defaults to 2h.",
-			},
 		},
 		Operations: map[logical.Operation]framework.OperationHandler{
 			logical.CreateOperation: &framework.PathOperation{Callback: b.pathRoleWrite},
@@ -145,8 +87,8 @@ func (b *backend) pathRoles() *framework.Path {
 			logical.DeleteOperation: &framework.PathOperation{Callback: b.pathRoleDelete},
 		},
 		ExistenceCheck:  b.roleExistenceCheck,
-		HelpSynopsis:    "Manage policy-template roles (TTL, rotation grace, optional coordinate constraints).",
-		HelpDescription: "A role supplies the TTL/max-TTL/rotation-grace policy for the coordinates it matches. Constraints (project_key, release_stage_key, type) are optional; empty fields are wildcards.",
+		HelpSynopsis:    "Manage the roles that allowlist which coordinates the mount may serve.",
+		HelpDescription: "A coordinate is served if any role matches it; overlapping roles union. Constraints (project_key, release_stage_key, type) are optional; empty fields are wildcards, so an unconstrained role is a catch-all.",
 	}
 }
 
@@ -183,12 +125,7 @@ func (b *backend) pathRoleWrite(ctx context.Context, req *logical.Request, d *fr
 		return nil, err
 	}
 	if role == nil {
-		role = &roleEntry{
-			Name:          name,
-			TTL:           defaultRoleTTL,
-			MaxTTL:        defaultRoleMaxTTL,
-			RotationGrace: defaultRotationGrace,
-		}
+		role = &roleEntry{Name: name}
 	}
 
 	if v, ok := d.GetOk("project_key"); ok {
@@ -200,36 +137,15 @@ func (b *backend) pathRoleWrite(ctx context.Context, req *logical.Request, d *fr
 	if v, ok := d.GetOk("type"); ok {
 		role.Type = v.(string)
 	}
-	if v, ok := d.GetOk("ttl"); ok {
-		role.TTL = time.Duration(v.(int)) * time.Second
-	}
-	if v, ok := d.GetOk("max_ttl"); ok {
-		role.MaxTTL = time.Duration(v.(int)) * time.Second
-	}
-	if v, ok := d.GetOk("rotation_grace"); ok {
-		role.RotationGrace = time.Duration(v.(int)) * time.Second
-	}
 
 	if role.Type != "" && !fmclient.SdkKeyType(role.Type).Valid() {
 		return logical.ErrorResponse("invalid type %q: must be web, server, or mobile", role.Type), nil
-	}
-	if role.MaxTTL > 0 && role.TTL > role.MaxTTL {
-		return logical.ErrorResponse("ttl (%s) must not exceed max_ttl (%s)", role.TTL, role.MaxTTL), nil
-	}
-	if role.RotationGrace <= 0 {
-		return logical.ErrorResponse("rotation_grace must be greater than zero"), nil
-	}
-
-	var resp *logical.Response
-	if role.TTL > 0 && role.RotationGrace >= role.TTL {
-		resp = &logical.Response{}
-		resp.AddWarning("rotation_grace is >= ttl; the grace window should be short relative to the key lifecycle")
 	}
 
 	if err := putJSON(ctx, req.Storage, storageRolePrefix+name, role); err != nil {
 		return nil, err
 	}
-	return resp, nil
+	return nil, nil
 }
 
 func (b *backend) pathRoleRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
@@ -245,9 +161,6 @@ func (b *backend) pathRoleRead(ctx context.Context, req *logical.Request, d *fra
 			"project_key":       role.ProjectKey,
 			"release_stage_key": role.ReleaseStageKey,
 			"type":              role.Type,
-			"ttl":               int64(role.TTL.Seconds()),
-			"max_ttl":           int64(role.MaxTTL.Seconds()),
-			"rotation_grace":    int64(role.RotationGrace.Seconds()),
 		},
 	}, nil
 }
