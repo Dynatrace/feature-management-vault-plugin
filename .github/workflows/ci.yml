@@ -32,20 +32,13 @@ jobs:
         run: go test -race -coverprofile=coverage.out ./...
 
   build:
-    name: Build (cross-compile)
+    name: Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
         with:
-          fetch-depth: 0
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-      # Verification only: a snapshot release runs the same GoReleaser pipeline
-      # used for real releases (build + archive + checksum) without publishing,
-      # so a broken cross-compile or packaging step fails the PR.
-      - uses: goreleaser/goreleaser-action@v6
-        with:
-          version: "~> v2"
-          args: release --snapshot --clean
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
