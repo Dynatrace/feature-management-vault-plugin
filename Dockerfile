@@ -1,13 +1,16 @@
 ARG GOLANG_VERSION=1.25
 ARG PLUGIN_NAME=vault-plugin-dynatrace-feature-management
+ARG BUILD_VERSION=dev
 
 FROM golang:${GOLANG_VERSION} AS builder
 ARG PLUGIN_NAME
+ARG BUILD_VERSION
 WORKDIR /workspace
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags="-s -w -X main.version=${BUILD_VERSION}" \
     -o /out/${PLUGIN_NAME} ./cmd/${PLUGIN_NAME} && \
     sha256sum /out/${PLUGIN_NAME} | cut -d' ' -f1 > /out/${PLUGIN_NAME}.sha256sum
 
