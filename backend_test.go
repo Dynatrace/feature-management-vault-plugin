@@ -3,6 +3,7 @@ package featuremanagement
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -752,4 +753,48 @@ func TestPickKey_IsDeterministic(t *testing.T) {
 
 	require.Nil(t, pickKey(&fmclient.SDKKeyList{}, fmclient.SdkKeyTypeServer))
 	require.Nil(t, pickKey(nil, fmclient.SdkKeyTypeServer))
+}
+
+// failingStorage makes Put fail under a prefix, to simulate storage dying mid-provision.
+type failingStorage struct {
+	logical.Storage
+	failPrefix string
+	fail       bool
+}
+
+func (f *failingStorage) Put(ctx context.Context, e *logical.StorageEntry) error {
+	if f.fail && strings.HasPrefix(e.Key, f.failPrefix) {
+		return errors.New("storage unavailable")
+	}
+	return f.Storage.Put(ctx, e)
+}
+
+// Failing to record a freshly created key is recoverable, not an orphan
+func TestProvision_StorageFailureNeitherOrphansNorDuplicates(t *testing.T) {
+	fake := fmclienttest.New()
+	b, base := testBackendWith(t, fake)
+	ctx := context.Background()
+	writeConfig(t, b, base)
+	writeDefaultRole(t, b, base)
+
+	s := &failingStorage{Storage: base, failPrefix: storageCurrentPrefix, fail: true}
+	read := func() (*logical.Response, error) {
+		return b.HandleRequest(ctx, &logical.Request{
+			Operation: logical.ReadOperation, Path: testCoordPath, Storage: s,
+		})
+	}
+
+	_, err := read()
+	require.Error(t, err, "the read fails because the record cannot be stored")
+	require.Len(t, fake.Created, 1, "but the key was created in FM")
+
+	_, err = read()
+	require.Error(t, err)
+	require.Len(t, fake.Created, 1, "a retry adopts that key rather than creating a second")
+
+	s.fail = false
+	resp := readCoordinate(t, b, s, testCoordPath)
+	require.Len(t, fake.Created, 1, "recovery still adopts the original key")
+	require.Equal(t, fake.Created[0], resp.Data["public_prefix"])
+	require.Equal(t, 1, fake.ActiveCount("checkout", "production"))
 }

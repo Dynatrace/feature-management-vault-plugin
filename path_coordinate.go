@@ -174,7 +174,7 @@ func (b *backend) provision(ctx context.Context, s logical.Storage, coord coordi
 		// another instance may have created one in the same window; converge on one winner
 		if list, err := client.ListSdkKeys(ctx, coord.Project, coord.ReleaseStage); err == nil {
 			if winner := pickKey(list, coord.Type); winner != nil && winner.SdkKey != chosen.SdkKey {
-				b.Logger().Warn("lost a concurrent create; adopting the winner and abandoning our key",
+				b.Logger().Info("adopted another instance's key after a concurrent create",
 					"coordinate", coord.String(),
 					"adopted", fmclient.PublicPrefix(winner.SdkKey),
 					"abandoned", fmclient.PublicPrefix(chosen.SdkKey))
