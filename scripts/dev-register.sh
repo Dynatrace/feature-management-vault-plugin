@@ -9,7 +9,7 @@
 set -euo pipefail
 
 PLUGIN_DIR="${PLUGIN_DIR:-$PWD/vault/plugins}"
-PLUGIN_NAME="${PLUGIN_NAME:-vault-plugin-secrets-feature-management}"
+PLUGIN_NAME="${PLUGIN_NAME:-vault-plugin-dynatrace-feature-management}"
 VERSION="${VERSION:-v0.0.1}"
 MOUNT="${MOUNT:-feature-management}"
 : "${VAULT_ADDR:=http://127.0.0.1:8200}"
@@ -39,8 +39,5 @@ fi
 # (`-version` is the KV-engine version flag).
 vault secrets enable -path="${MOUNT}" -plugin-version="${VERSION}" "${PLUGIN_NAME}"
 
-# SDK keys are long-lived; raise the mount's max lease TTL above the system
-# default (768h) so role TTLs like 2280h are not capped.
-vault secrets tune -max-lease-ttl=4560h "${MOUNT}"
 
 echo "enabled ${PLUGIN_NAME} ${VERSION} at ${MOUNT}/"

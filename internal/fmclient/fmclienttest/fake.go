@@ -1,8 +1,4 @@
-// Package fmclienttest provides an in-memory fmclient.FMClient for tests and
-// local fixtures (mirrors the convention of net/http/httptest). It lives in its
-// own package, rather than a _test.go file, because it is shared across package
-// boundaries — the root plugin tests and the mock FM server both use it — which
-// _test.go symbols cannot be.
+// Package fmclienttest is an in-memory fmclient.FMClient shared by the plugin tests and mock server.
 package fmclienttest
 
 import (
@@ -17,8 +13,7 @@ import (
 	"github.com/dynatrace/feature-management-vault-plugin/internal/fmclient"
 )
 
-// Fake is an in-memory fmclient.FMClient. It is safe for concurrent use. Tests
-// can force failures via the *Err hooks and inspect the Created/Deleted logs.
+// Fake is a concurrency-safe in-memory fmclient.FMClient; the *Err hooks force failures.
 type Fake struct {
 	mu sync.Mutex
 
@@ -30,11 +25,12 @@ type Fake struct {
 	// Failure-injection hooks; when set, the corresponding call returns the error.
 	CreateErr error
 	ListErr   error
-	DeleteErr error
 
-	// Call logs (public prefixes only) for assertions.
+	// BeforeList runs at the top of ListSdkKeys so a test can simulate another instance racing it.
+	BeforeList func()
+
+	// Call log (public prefixes only) for assertions.
 	Created []string
-	Deleted []string
 }
 
 var _ fmclient.FMClient = (*Fake)(nil)
@@ -92,6 +88,9 @@ func (f *Fake) CreateSdkKey(_ context.Context, project, releaseStage string, key
 
 // ListSdkKeys implements fmclient.FMClient.
 func (f *Fake) ListSdkKeys(_ context.Context, project, releaseStage string) (*fmclient.SDKKeyList, error) {
+	if f.BeforeList != nil {
+		f.BeforeList()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.ListErr != nil {
@@ -106,27 +105,18 @@ func (f *Fake) ListSdkKeys(_ context.Context, project, releaseStage string) (*fm
 	return &cp, nil
 }
 
-// DeleteSdkKey implements fmclient.FMClient.
-func (f *Fake) DeleteSdkKey(_ context.Context, project, releaseStage, sdkKey string) error {
+// Drop simulates a key disappearing from the FM service out of band; not an FMClient method.
+func (f *Fake) Drop(project, releaseStage, sdkKey string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.DeleteErr != nil {
-		return f.DeleteErr
-	}
 	list := f.keys[coordKey(project, releaseStage)]
 	if list == nil {
-		return fmclient.ErrNotFound
+		return
 	}
-	before := len(list.Web) + len(list.Mobile) + len(list.Server)
 	match := func(d fmclient.SDKKeyDetails) bool { return d.SdkKey == sdkKey }
 	list.Web = slices.DeleteFunc(list.Web, match)
 	list.Mobile = slices.DeleteFunc(list.Mobile, match)
 	list.Server = slices.DeleteFunc(list.Server, match)
-	if len(list.Web)+len(list.Mobile)+len(list.Server) == before {
-		return fmclient.ErrNotFound
-	}
-	f.Deleted = append(f.Deleted, fmclient.PublicPrefix(sdkKey))
-	return nil
 }
 
 // ActiveCount returns the total number of active keys for a coordinate.

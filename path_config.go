@@ -33,13 +33,14 @@ var tenantPattern = regexp.MustCompile(`^[a-zA-Z0-9]{8,10}$`)
 // fields in the same request), while a write that sets ClientID/ClientSecret
 // without a path selects inline mode. The losing source's fields are cleared.
 type fmConfig struct {
-	FMBaseURL          string   `json:"fm_base_url"`
-	TokenURL           string   `json:"token_url"`
-	ClientID           string   `json:"client_id"`
-	ClientSecret       string   `json:"client_secret"`
-	Tenant             string   `json:"dt_tenant"`
-	Scopes             []string `json:"scopes,omitempty"`
-	HTTPTimeoutSeconds int      `json:"http_timeout_seconds,omitempty"`
+	FMBaseURL                string   `json:"fm_base_url"`
+	TokenURL                 string   `json:"token_url"`
+	ClientID                 string   `json:"client_id"`
+	ClientSecret             string   `json:"client_secret"`
+	Tenant                   string   `json:"dt_tenant"`
+	Scopes                   []string `json:"scopes,omitempty"`
+	HTTPTimeoutSeconds       int      `json:"http_timeout_seconds,omitempty"`
+	ReconcileIntervalSeconds int      `json:"reconcile_interval_seconds,omitempty"`
 
 	// Sourced-credentials fields (empty in inline mode).
 	ClientCredentialsPath string `json:"client_credentials_path,omitempty"`
@@ -273,6 +274,10 @@ func (b *backend) pathConfig() *framework.Path {
 				Type:        framework.TypeCommaStringSlice,
 				Description: "OAuth scopes to request. Defaults to the three feature-management:sdk-keys scopes.",
 			},
+			"reconcile_interval": {
+				Type:        framework.TypeDurationSecond,
+				Description: "How often the reconciliation loop re-points records at the newest key FM holds. Jittered by a third either way per instance, so 6h becomes 4h-8h. Minimum 5m; set to 0 to disable the loop. Defaults to 6h.",
+			},
 			"http_timeout_seconds": {
 				Type:        framework.TypeInt,
 				Description: "HTTP timeout for FM API calls, in seconds.",
@@ -330,6 +335,17 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 	}
 	if v, ok := d.GetOk("http_timeout_seconds"); ok {
 		cfg.HTTPTimeoutSeconds = v.(int)
+	}
+	if v, ok := d.GetOk("reconcile_interval"); ok {
+		switch secs := v.(int); {
+		case secs == 0:
+			cfg.ReconcileIntervalSeconds = reconcileDisabled
+		case secs < minReconcileInterval:
+			return logical.ErrorResponse("reconcile_interval must be at least %s, or 0 to disable the loop",
+				minReconcileInterval*time.Second), nil
+		default:
+			cfg.ReconcileIntervalSeconds = secs
+		}
 	}
 	_, gotCredsPath := d.GetOk("client_credentials_path")
 	if v, ok := d.GetOk("client_credentials_path"); ok {
@@ -516,6 +532,7 @@ func (b *backend) pathConfigRead(ctx context.Context, req *logical.Request, _ *f
 		"dt_tenant":            cfg.Tenant,
 		"scopes":               cfg.scopesOrDefault(),
 		"http_timeout_seconds": cfg.HTTPTimeoutSeconds,
+		"reconcile_interval":   reconcileIntervalForDisplay(cfg),
 		// client_secret and auth_secret_id are intentionally never returned.
 	}
 	if cfg.usesSourcedCredentials() {
@@ -550,4 +567,12 @@ func (b *backend) pathConfigDelete(ctx context.Context, req *logical.Request, _ 
 	}
 	b.resetClient()
 	return nil, nil
+}
+
+// reconcileIntervalForDisplay echoes the write convention: 0 means the loop is off.
+func reconcileIntervalForDisplay(cfg *fmConfig) int64 {
+	if !cfg.reconcileEnabled() {
+		return 0
+	}
+	return int64(cfg.reconcileInterval().Seconds())
 }

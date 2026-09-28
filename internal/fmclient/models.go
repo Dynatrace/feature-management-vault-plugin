@@ -1,10 +1,4 @@
-// Package fmclient is a small client for the Dynatrace Feature Management
-// Service SDK-keys API. It is intentionally narrow (create/list/delete SDK
-// keys) so it can be mocked in tests and later extracted into a standalone,
-// reusable Go SDK module.
-//
-// Contract source: Feature Management API OpenAPI v0.1.45
-// (/public/feature-management-service/v0.1).
+// Package fmclient is a narrow client (create and list SDK keys) for the Dynatrace Feature Management API.
 package fmclient
 
 import (
@@ -74,15 +68,6 @@ func (l SDKKeyList) OfType(t SdkKeyType) []SDKKeyDetails {
 	default:
 		return nil
 	}
-}
-
-// All returns every key across all types.
-func (l SDKKeyList) All() []SDKKeyDetails {
-	out := make([]SDKKeyDetails, 0, len(l.Web)+len(l.Mobile)+len(l.Server))
-	out = append(out, l.Web...)
-	out = append(out, l.Mobile...)
-	out = append(out, l.Server...)
-	return out
 }
 
 // PublicPrefix returns the log-safe portion of an SDK key: the first two

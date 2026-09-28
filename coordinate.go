@@ -60,17 +60,6 @@ func parseCoordinate(version, releaseStage, project, typ string) (coordinate, er
 	return c, nil
 }
 
-// parseCoordinateString parses a canonical coordinate string
-// ("version/release-stage/project/type"), used to rebuild a coordinate from a
-// lease's internal data or a WAL/tombstone record.
-func parseCoordinateString(s string) (coordinate, error) {
-	parts := strings.Split(s, "/")
-	if len(parts) != 4 {
-		return coordinate{}, fmt.Errorf("invalid coordinate %q", s)
-	}
-	return parseCoordinate(parts[0], parts[1], parts[2], parts[3])
-}
-
 // tokenVersion extracts the `dtNN` token from a full SDK key, used to verify a
 // minted key's format version matches the requested coordinate.
 func tokenVersion(sdkKey string) string {

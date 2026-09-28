@@ -3,6 +3,7 @@ package featuremanagement
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -14,23 +15,42 @@ import (
 	"github.com/dynatrace/feature-management-vault-plugin/internal/fmclient"
 )
 
-const secretTypeSDKKey = "fm_sdk_key"
+const (
+	// defaultReconcileInterval is the loop cadence when the mount does not set one.
+	defaultReconcileInterval = 6 * time.Hour
+
+	// minReconcileInterval floors the configured interval, in seconds, to spare FM pointless load.
+	minReconcileInterval = 300
+
+	// reconcileDisabled is the stored sentinel for a loop turned off; on the wire that is 0.
+	reconcileDisabled = -1
+)
+
+// reconcileInterval is the mount's configured loop cadence, or the default when unset.
+func (c *fmConfig) reconcileInterval() time.Duration {
+	if c == nil || c.ReconcileIntervalSeconds <= 0 {
+		return defaultReconcileInterval
+	}
+	return time.Duration(c.ReconcileIntervalSeconds) * time.Second
+}
+
+// reconcileEnabled reports whether the reconciliation loop should run on this mount.
+func (c *fmConfig) reconcileEnabled() bool {
+	return c == nil || c.ReconcileIntervalSeconds != reconcileDisabled
+}
+
+// nextReconcileAt spreads passes over interval +/- a third so instances never run in lockstep.
+func nextReconcileAt(interval time.Duration) time.Time {
+	spread := interval / 3
+	return time.Now().Add(interval - spread + time.Duration(rand.Int63n(int64(2*spread))))
+}
 
 // Storage key prefixes.
 const (
-	storageConfig          = "config"
-	storageRolePrefix      = "role/"
-	storageCurrentPrefix   = "current/"
-	storageTombstonePrefix = "tombstone/"
+	storageConfig        = "config"
+	storageRolePrefix    = "role/"
+	storageCurrentPrefix = "current/"
 )
-
-// walKindCreate marks an in-flight createSdkKey so a crash between create and
-// store can be reconciled (the orphaned-key reaper).
-const walKindCreate = "fm_create_sdkkey"
-
-// walRollbackMinAge must exceed the worst-case createSdkKey latency so a merely
-// slow create isn't reaped mid-flight.
-const walRollbackMinAge = 10 * time.Minute
 
 // backend is the Feature Management secrets engine.
 type backend struct {
@@ -52,6 +72,10 @@ type backend struct {
 	// record, preventing a double-mint race.
 	coordLocks []*locksutil.LockEntry
 
+	// reconcileMu guards nextReconcile, the schedule for the reconciliation loop.
+	reconcileMu   sync.Mutex
+	nextReconcile time.Time
+
 	// metrics are the OpenTelemetry instruments for the SDK-key lifecycle.
 	metrics *metrics
 }
@@ -71,8 +95,9 @@ func newBackend() *backend {
 		clientFactory: func(cfg fmclient.Config) (fmclient.FMClient, error) {
 			return fmclient.New(cfg)
 		},
-		resolveCreds: resolveSourcedCredentials,
-		metrics:      newDefaultMetrics(),
+		resolveCreds:  resolveSourcedCredentials,
+		nextReconcile: nextReconcileAt(defaultReconcileInterval),
+		metrics:       newDefaultMetrics(),
 	}
 
 	b.Backend = &framework.Backend{
@@ -83,7 +108,6 @@ func newBackend() *backend {
 				storageConfig,
 				"role/*",
 				"current/*",
-				"tombstone/*",
 			},
 		},
 		Paths: []*framework.Path{
@@ -91,17 +115,11 @@ func newBackend() *backend {
 			b.pathRoles(),
 			b.pathRolesList(),
 			b.pathCoordinateRead(),
-			b.pathRotate(),
 			b.pathReconcile(),
 		},
-		Secrets: []*framework.Secret{
-			b.sdkKeySecret(),
-		},
-		PeriodicFunc:      b.periodicFunc,
-		WALRollback:       b.walRollback,
-		WALRollbackMinAge: walRollbackMinAge,
-		Invalidate:        b.invalidate,
-		Clean:             b.clean,
+		PeriodicFunc: b.periodicFunc,
+		Invalidate:   b.invalidate,
+		Clean:        b.clean,
 	}
 	return b
 }
@@ -157,6 +175,10 @@ func (b *backend) resetClient() {
 func (b *backend) invalidate(_ context.Context, key string) {
 	if key == storageConfig {
 		b.resetClient()
+		// re-arm so a changed reconcile_interval takes effect on the next tick
+		b.reconcileMu.Lock()
+		b.nextReconcile = time.Time{}
+		b.reconcileMu.Unlock()
 	}
 }
 
@@ -170,8 +192,7 @@ func (b *backend) lockCoordinate(coord coordinate) *locksutil.LockEntry {
 	return locksutil.LockForKey(b.coordLocks, coord.String())
 }
 
-// isStandby reports whether this node must not perform storage writes (a
-// performance standby or DR secondary). Background sweeps gate on this.
+// isStandby reports whether this node must not write storage (perf standby or DR secondary).
 func (b *backend) isStandby() bool {
 	repl := b.System().ReplicationState()
 	return repl.HasState(consts.ReplicationPerformanceStandby) ||
@@ -180,10 +201,10 @@ func (b *backend) isStandby() bool {
 
 const backendHelp = `
 The Feature Management secrets engine brokers SDK keys from the Dynatrace
-Feature Management Service, treating each key as a dynamic secret tied to a
-Vault lease. Configure the mount with the FM service URL and OAuth client
-credentials at "config", define policy templates at "roles/<name>", then read a
-key at "<version>/<release-stage>/<project>/<type>". Keys are deleted when their
-lease expires or is revoked; rotation (create-new then delete-old after a grace
-window) is available at "rotate/<version>/<release-stage>/<project>/<type>".
+Feature Management Service. Configure the mount with the FM service URL and
+OAuth client credentials at "config", define which coordinates the mount may
+serve at "roles/<name>", then read a key at
+"<version>/<release-stage>/<project>/<type>". A read adopts the key FM already
+holds, or provisions one if FM has none. A reconciliation loop re-points records
+at the newest key FM holds. The engine never deletes keys.
 `

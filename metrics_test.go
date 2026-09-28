@@ -2,17 +2,14 @@ package featuremanagement
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
-
-	"github.com/dynatrace/feature-management-vault-plugin/internal/fmclient"
 )
 
-func TestMetrics_IssuedAndRevoked(t *testing.T) {
+func TestMetrics_Issued(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	m, err := newMetrics(provider.Meter(instrumentationName))
@@ -22,17 +19,13 @@ func TestMetrics_IssuedAndRevoked(t *testing.T) {
 	coord, err := parseCoordinate("dt01", "production", "checkout", "server")
 	require.NoError(t, err)
 
-	m.recordIssued(ctx, coord, true)                                    // minted
-	m.recordIssued(ctx, coord, false)                                   // re-leased existing
-	m.recordRevoked(ctx, "server", "production", nil)                   // ok
-	m.recordRevoked(ctx, "server", "production", fmclient.ErrNotFound)  // ok (already gone)
-	m.recordRevoked(ctx, "server", "production", errors.New("FM down")) // error
+	m.recordIssued(ctx, coord, true)  // consulted FM
+	m.recordIssued(ctx, coord, false) // served from local storage
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(ctx, &rm))
 
 	require.EqualValues(t, 2, sumOf(t, &rm, "feature_management.sdk_keys.issued"))
-	require.EqualValues(t, 3, sumOf(t, &rm, "feature_management.sdk_keys.revoked"))
 }
 
 // sumOf returns the total across all data points for the named int64 sum metric.
