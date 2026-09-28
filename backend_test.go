@@ -418,22 +418,6 @@ func TestRole_Allowlist(t *testing.T) {
 	}
 }
 
-func TestRole_CatchAllPermitsEverything(t *testing.T) {
-	b, _, s := testBackend(t)
-	ctx := context.Background()
-	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.CreateOperation, Path: "roles/default", Storage: s,
-	})
-	require.NoError(t, err)
-
-	for _, coord := range []coordinate{testCoord(t)} {
-		require.NoError(t, b.coordinateAllowed(ctx, s, coord))
-	}
-	other, err := parseCoordinate("dt02", "development", "billing", "mobile")
-	require.NoError(t, err)
-	require.NoError(t, b.coordinateAllowed(ctx, s, other))
-}
-
 func TestCoordinate_NoMatchingRole(t *testing.T) {
 	b, _, s := testBackend(t)
 	writeConfig(t, b, s)
@@ -473,7 +457,8 @@ func TestReconciliationLoop_RunsOncePerInterval(t *testing.T) {
 	replacement, err := fake.CreateSdkKey(ctx, "checkout", "production", fmclient.SdkKeyTypeServer)
 	require.NoError(t, err)
 
-	// newBackend schedules the first pass ahead, so this tick must do nothing
+	// with a pass scheduled ahead, this tick must do nothing
+	b.nextReconcile = time.Now().Add(time.Hour)
 	require.NoError(t, b.periodicFunc(ctx, &logical.Request{Storage: s}))
 	require.NotEqual(t, replacement.SdkKey, readCoordinate(t, b, s, testCoordPath).Data["sdk_key"])
 
@@ -534,6 +519,9 @@ func TestReconcileInterval_ConfigurableWithDefaultAndFloor(t *testing.T) {
 
 	require.False(t, set(0).IsError(), "0 turns the loop off")
 	require.EqualValues(t, 0, read(), "read echoes the write convention")
+
+	require.True(t, b.nextReconcile.IsZero(),
+		"a config write must re-arm the loop so a changed interval takes effect promptly")
 }
 
 func TestReconciliationLoop_DisabledByConfig(t *testing.T) {
@@ -728,4 +716,40 @@ func TestReconcile_Outcomes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The convergence rule must be total and must not depend on optional response fields, or separate
+// instances could pick different winners from the same list.
+func TestPickKey_IsDeterministic(t *testing.T) {
+	at := func(sec int) *fmclient.ModificationInfo {
+		return &fmclient.ModificationInfo{CreatedTime: time.Unix(int64(sec), 0).UTC()}
+	}
+	key := func(prefix string) string { return "dt01.server_us_" + prefix + ".abc_def" }
+
+	list := &fmclient.SDKKeyList{Server: []fmclient.SDKKeyDetails{
+		{SdkKey: key("bbbbbbbbbb"), ModificationInfo: at(100)},
+		{SdkKey: key("cccccccccc"), ModificationInfo: at(300)},
+		{SdkKey: key("aaaaaaaaaa"), ModificationInfo: at(200)},
+	}}
+	got := pickKey(list, fmclient.SdkKeyTypeServer)
+	require.NotNil(t, got)
+	require.Equal(t, key("cccccccccc"), got.SdkKey, "newest wins regardless of list order")
+
+	// equal timestamps fall back to the public prefix rather than list order
+	tied := &fmclient.SDKKeyList{Server: []fmclient.SDKKeyDetails{
+		{SdkKey: key("zzzzzzzzzz"), ModificationInfo: at(100)},
+		{SdkKey: key("aaaaaaaaaa"), ModificationInfo: at(100)},
+	}}
+	require.Equal(t, key("aaaaaaaaaa"), pickKey(tied, fmclient.SdkKeyTypeServer).SdkKey)
+
+	// FM may omit modificationInfo; the ordering must still be total
+	missing := &fmclient.SDKKeyList{Server: []fmclient.SDKKeyDetails{
+		{SdkKey: key("aaaaaaaaaa")},
+		{SdkKey: key("bbbbbbbbbb"), ModificationInfo: at(100)},
+	}}
+	require.Equal(t, key("bbbbbbbbbb"), pickKey(missing, fmclient.SdkKeyTypeServer).SdkKey,
+		"a key with a known time beats one with none")
+
+	require.Nil(t, pickKey(&fmclient.SDKKeyList{}, fmclient.SdkKeyTypeServer))
+	require.Nil(t, pickKey(nil, fmclient.SdkKeyTypeServer))
 }

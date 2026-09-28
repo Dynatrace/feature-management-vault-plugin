@@ -175,11 +175,15 @@ func (b *backend) resetClient() {
 func (b *backend) invalidate(_ context.Context, key string) {
 	if key == storageConfig {
 		b.resetClient()
-		// re-arm so a changed reconcile_interval takes effect on the next tick
-		b.reconcileMu.Lock()
-		b.nextReconcile = time.Time{}
-		b.reconcileMu.Unlock()
+		b.rearmReconcile()
 	}
+}
+
+// rearmReconcile makes the next tick run a pass, so a changed reconcile_interval takes effect.
+func (b *backend) rearmReconcile() {
+	b.reconcileMu.Lock()
+	b.nextReconcile = time.Time{}
+	b.reconcileMu.Unlock()
 }
 
 // clean is called on backend unload.

@@ -464,9 +464,9 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 		return nil, err
 	}
 
-	// Invalidate isn't guaranteed to fire on the writing node in all topologies,
-	// so drop the cached client here too.
+	// the writing node may not get its own Invalidate callback, so clear its caches here
 	b.resetClient()
+	b.rearmReconcile()
 
 	// Flag the common foot-gun of a deployed mount still pointing at a local
 	// test/mock FM service (e.g. config copied from the demo), plus any
