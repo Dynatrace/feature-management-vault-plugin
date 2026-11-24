@@ -18,5 +18,5 @@ metadata:
 spec:
   type: plugin
   lifecycle: experimental
-  owner: group:default/team-rd-sg-team-feature-management
+  owner: group:default/rd-sg-team-feature-management
   system: system:default/feature-management
